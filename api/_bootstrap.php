@@ -1,6 +1,11 @@
 <?php
 declare(strict_types=1);
 
+// Lottery upstream bridge (no-op unless lottery_upstream_url is configured).
+if (is_file(__DIR__ . '/_lottery_upstream.php')) {
+    require_once __DIR__ . '/_lottery_upstream.php';
+}
+
 function api_config(): array
 {
     static $config = null;

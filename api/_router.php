@@ -19,6 +19,15 @@ if ($endpoint === '') {
     ]));
 }
 
+// Lottery endpoints go to the configured engine first; if it is unreachable
+// the local implementation below still answers, so the site never goes dark.
+if (function_exists('lottery_upstream_handle_endpoint')) {
+    $upstream = lottery_upstream_handle_endpoint($endpoint, $input);
+    if ($upstream !== null) {
+        api_emit($upstream);
+    }
+}
+
 $override = api_get_override($endpoint);
 if ($override) {
     $decoded = api_json_decode_lenient((string) $override['content']);
