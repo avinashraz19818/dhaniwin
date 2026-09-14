@@ -10,7 +10,9 @@
  */
 
 const CACHE_PREFIX = 'ar-pwa';
-const STATIC_CACHE = `${CACHE_PREFIX}-static-v1`;
+// v2: bump forces the activate handler to drop old static caches so patched
+// game files (Wingo history auto-refresh / balance fixes) reach every device.
+const STATIC_CACHE = `${CACHE_PREFIX}-static-v2`;
 const CONFIG_CACHE = `${CACHE_PREFIX}-config-v1`;
 
 // 匹配带哈希的静态资源 (如: index-a1b2c3d4.js)

@@ -1134,6 +1134,21 @@ function api_set_default_settings(PDO $pdo): void
         'default_wallet_balance' => '0',
         'default_game_balance' => '4.45',
         'wheel_allow_daily_extra_spin' => '1',
+        // ---- Wingo balance consistency (see api_wingo_* helpers) ----
+        // On game entry (Lottery/GetUserInfo) move the member's main wallet
+        // into the game wallet, so the game card always shows the full money.
+        // Leaving it at 0 is the classic "balance shows in the app header but
+        // Rs 0.00 inside Wingo" complaint.
+        'wingo_auto_transfer' => '1',
+        // What the Wingo balance card displays: game | total
+        'wingo_balance_mode' => 'game',
+        // Settle a bet the moment it is placed (win/loss + balance instantly).
+        'wingo_instant_settle' => '1',
+        // Accept the member token via ?Token= / dh_tok cookie as well, because
+        // APK/WebView builds lose the Authorization header.
+        'wingo_webview_handoff' => '1',
+        // Do NOT silently become the first member when no token is sent.
+        'allow_first_user_fallback' => '0',
     ];
     $driver = api_db_driver($pdo);
     foreach ($defaults as $key => $value) {
@@ -1789,14 +1804,18 @@ function api_wingo_shown_balance(array $bal): float
  */
 function api_wingo_maybe_auto_transfer(array $member): void
 {
-    if ((string) api_setting('wingo_auto_transfer', '0') !== '1') {
+    if ((string) api_setting('wingo_auto_transfer', '1') !== '1') {
         return;
     }
-    if (empty($member['id'])) {
+    if (empty($member['id']) || !empty($member['is_guest'])) {
         return;
     }
     $bal = api_user_balances($member);
-    if ($bal['game'] >= 1.0 || $bal['wallet'] <= 0.0) {
+    // Always sweep the full main wallet into the game wallet on game entry.
+    // (Old builds skipped this when the game wallet already held >= 1.00, so
+    // money recharged later kept sitting in the main wallet and the Wingo
+    // balance card looked wrong/out-of-sync.)
+    if ($bal['wallet'] <= 0.0) {
         return;
     }
     $pdo = api_pdo();
@@ -1906,8 +1925,12 @@ function api_primary_user(): array
         return $currentUser;
     }
 
-    // No token at all -> legacy fallback (public routes/tests still work)
-    if ($pdo) {
+    // No token at all. The old behaviour silently became the FIRST member row,
+    // which is exactly why anonymous/stale WebViews sometimes displayed (or
+    // even moved) another account's balance. Default now: guest. The legacy
+    // first-user fallback can be re-enabled for local testing only via the
+    // api_settings key  allow_first_user_fallback = 1
+    if ((string) api_setting('allow_first_user_fallback', '0') === '1' && $pdo) {
         try {
             $row = $pdo->query("SELECT * FROM api_users ORDER BY id LIMIT 1")->fetch();
             if ($row) {
@@ -1918,16 +1941,8 @@ function api_primary_user(): array
         }
     }
 
-    return [
-        'id' => 1,
-        'user_id' => 132257,
-        'username' => 'local_member',
-        'nickname' => 'MemberNNGKLPHA',
-        'phone' => '919119098026',
-        'wallet_balance' => 0,
-        'game_balance' => 4.45,
-        'can_bet' => 1,
-    ];
+    $currentUser = api_guest_user();
+    return $currentUser;
 }
 
 // api_client_ip robust implementation is declared above
@@ -2046,8 +2061,19 @@ function api_user_login(array $input): array
         return api_error('Invalid password', 401);
     }
 
-    $token = 'local_' . sha1((string) $username . microtime(true));
-    $tokenExpire = api_now_ms() + 604800000;
+    // Keep the member's existing token when it is still valid.
+    // Rotating the token on EVERY login silently logged out every other
+    // device/browser/APK WebView of the same member (their cached
+    // ar_g_token no longer matched) -> the Wingo balance card showed
+    // Rs 0.00 on "some phones, some browsers" while the site itself still
+    // looked logged in. One stable token per member keeps the balance
+    // consistent everywhere; it only rotates when missing or expired.
+    $token = (string) ($user['token'] ?? '');
+    $tokenExpire = (int) ($user['token_expire'] ?? 0);
+    if ($token === '' || $tokenExpire < api_now_ms()) {
+        $token = 'local_' . sha1((string) $username . microtime(true) . mt_rand());
+        $tokenExpire = api_now_ms() + 604800000;
+    }
 
     $ip = api_client_ip();
     $raw = [];
@@ -2304,11 +2330,19 @@ function api_lottery_issue_data(string $gameCode): array
     $periodMs = $period * 1000;
     $start = (int) (floor($now / $periodMs) * $periodMs);
     $end = $start + $periodMs;
-    
-    // 1-period lag offset behind upstream:
-    $lagStart = $start - $periodMs;
-    $issue = api_lottery_calculate_issue($gameCode, (int)($lagStart / 1000));
-    $nextIssue = api_lottery_calculate_issue($gameCode, (int)($start / 1000));
+
+    // The betting issue is the issue that belongs to the CURRENT window.
+    // (Old builds lagged one period behind: the issue shown for betting was the
+    // same one already sitting on top of the history list with its result
+    // pre-generated. That meant the result was visible BEFORE the round ended
+    // and, when the timer hit zero, no new row ever appeared in the game
+    // history - users had to refresh the page to see a "new" result.
+    // With the current-window issue the contract matches the frontend:
+    //   - while betting on issue W, history top = W-1 (last finished round)
+    //   - the moment the timer ends, history top becomes W (result appears
+    //     automatically, no refresh needed) and betting moves to W+1.)
+    $issue = api_lottery_calculate_issue($gameCode, (int)($start / 1000));
+    $nextIssue = api_lottery_calculate_issue($gameCode, (int)($end / 1000));
     $secondsLeft = max(0, (int) ceil(($end - $now) / 1000));
     $isLocked = ($secondsLeft <= 5);
     
@@ -3759,7 +3793,10 @@ function api_recharge_category_payload(): array
 
 function api_recharge_basic_info_payload(): array
 {
-    $user = api_primary_user();
+    $user = api_member_user();
+    if (!empty($user['id']) && empty($user['is_guest'])) {
+        $user = api_user_fresh();
+    }
     return api_success([
         'gameSaasBalance' => (function () use ($user) {
             $bal = api_user_balances($user);
@@ -4232,7 +4269,13 @@ function api_withdraw_history_payload(array $input): array
 function api_thirdgame_transfer_payload(array $input, bool $recover = false): array
 {
     $pdo = api_pdo();
-    $user = api_primary_user();
+    // Never move money on behalf of an unresolved identity. api_primary_user()
+    // falls back to the FIRST member row when no token arrives, which used to
+    // transfer somebody else's wallet on anonymous/guest requests.
+    $user = api_member_user();
+    if (empty($user['id']) || !empty($user['is_guest'])) {
+        return api_error('Please login again', 143, 401);
+    }
     if (!$pdo) {
         return api_success([
             'walletBalance' => (float) $user['wallet_balance'],

@@ -211,7 +211,10 @@ function Nt({
                 }, 1150), setTimeout(() => {
                     s && s.stop()
                 }, 2e3), setTimeout(async () => {
-                    W.value = "", ce((t == null ? void 0 : t.list) || []), y.value = !1, s && s.clear(), R.value = !1
+                    // Fetch FRESH history now (the round has ended); the list
+                    // captured at e==1 was pre-draw and would overwrite the
+                    // auto-refresh with stale rows.
+                    W.value = "", await Me(), y.value = !1, s && s.clear(), R.value = !1
                 }, 2700), setTimeout(async () => {
                     await K()
                 }, 3200)
@@ -227,10 +230,13 @@ function Nt({
                 }, 2500), await q(800);
                 const t = await ie(i.value);
                 setTimeout(async () => {
-                    ce((t == null ? void 0 : t.list) || [])
-                }, 800), setTimeout(async () => {
+                    // Fresh history pull after the draw moment; the pre-draw
+                    // list captured above would keep the finished round out of
+                    // the game history until a manual page refresh.
+                    await Me()
+                }, 1800), setTimeout(async () => {
                     await K()
-                }, 2200)
+                }, 2600)
             }
         },
         {

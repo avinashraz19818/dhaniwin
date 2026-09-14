@@ -157,7 +157,19 @@ function ut(a) {
         var u;
         t.issue = e.issueNumber;
         const s = e.countdown;
-        s === 0 ? t.countdown = s + 1 : t.countdown = s, a && ((u = a == null ? void 0 : a.startCallback) == null || u.call(a, s)), ce()
+        s === 0 ? t.countdown = s + 1 : t.countdown = s, a && ((u = a == null ? void 0 : a.startCallback) == null || u.call(a, s)), ce();
+        // --- auto result refresh when the timer ends -------------------------
+        // The vendor build waited for an external websocket push to update the
+        // game history after a round finished, but for WinGo that socket is
+        // never opened on this site, so history stayed stale until the page was
+        // refreshed. A new issue is applied exactly when the countdown hits
+        // zero, so re-pull the history (and the member's win/loss + balance)
+        // a moment after every issue switch. B = getHistoryIssues,
+        // Ae = getWinLossResult (both defined further down in this scope).
+        try {
+            setTimeout(() => { try { B() } catch (e2) {} }, 1500);
+            setTimeout(() => { try { B(), Ae() } catch (e2) {} }, 4200);
+        } catch (e3) {}
     }, me = () => {
         t.sound = !t.sound
     }, fe = () => {
@@ -287,7 +299,11 @@ function ut(a) {
     }, he = async () => {
         const e = h.query.gameCode || h.params.gameCode;
         D(e), V.value && pe(), await Promise.all([S(!0), Y(), G(), B()]), setTimeout(async () => {
-            await R(), await Z()
+            // getUserInfo first: it triggers the wallet->game auto transfer on
+            // the server; reading the balance before that ran made the Wingo
+            // card show the pre-transfer (often 0) amount until the next
+            // manual refresh.
+            await Z(), await R()
         }, 1200)
     }, Ie = async e => {
         b.value || e.state !== 2 && e.gameCode !== c.value && (D(e.gameCode), d.clear(), await y.replace({

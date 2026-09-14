@@ -1,0 +1,100 @@
+=====================================================================
+DHANIWIN - WINGO FIX PACK  (v25 - 14 Sep 2026)
+Build: v25-wingo-history-autorefresh-balance
+=====================================================================
+
+KYA FIX HUA (What is fixed)
+---------------------------
+
+1) WINGO GAME HISTORY - RESULT AB APNE AAP AAYEGA (no refresh needed)
+   Problem: Timer end hone ke baad game history me naya result apne aap
+   nahi aata tha, page refresh karna padta tha.
+
+   Root cause (2 cheezein):
+   a) Backend round numbering 1 period "lag" kar raha tha. Jis round par
+      bet lag rahi hoti thi, usi ka result pehle se history ke top par
+      dikhta tha (pre-draw leak). Isliye timer khatam hote hi koi NAYI
+      row history me kabhi aati hi nahi thi - sirf refresh par kuch
+      badla hua lagta tha.
+   b) Vendor build game-history update ke liye ek external websocket
+      (wss://ws-pro.ar-lottery01.com) par depend karta tha - wo socket
+      WinGo page me kabhi open hi nahi hota, isliye auto-update ka koi
+      raasta hi nahi bachta tha.
+
+   Fix:
+   - api/_bootstrap.php: betting issue ab CURRENT window ka hota hai.
+     Matlab: round W chal raha hai -> history top par W-1 (last finished
+     round). Timer khatam hote hi history top par W ka result aa jata
+     hai. Bonus: ab round ka result round khatam hone se PEHLE dikhna
+     band ho gaya (pehle visible leak tha - koi bhi number dekh kar bet
+     laga sakta tha).
+   - js/BetRule-DyIqbhnc.js: har issue switch (timer zero) ke ~1.5s aur
+     ~4.2s baad history + win/loss + balance apne aap re-fetch hota hai.
+     Ye sab WinGo ke saare modes (30s/1M/3M/5M), K3, 5D, TRX WinGo,
+     MotoRace par lagu hota hai - sab same core use karte hain.
+   - js/useWingo-C_0L1WoG.js: result animation ke purane (stale) list
+     ko fresh fetch se replace kiya, taaki animation ke baad history
+     sahi row dikhaye.
+
+2) WINGO BALANCE - SAB JAGAH SAME DIKHEGA (phone / APK / Chrome)
+   Problem: Balance kahi dikhta tha kahi nahi - phone me sahi, APK me
+   0.00, Chrome me kabhi kabhi galat account ka.
+
+   Root cause (3 cheezein):
+   a) Har login par member ka token rotate ho jata tha. Ek hi member
+      phone + APK + Chrome par logged in ho to purane devices ka cached
+      game-token (ar_g_token) invalid ho jata tha -> game API ko
+      "guest" samajhta tha -> balance Rs 0.00.
+   b) Agar kisi request me token bilkul nahi milta tha to API chupchap
+      DATABASE KA PEHLA USER ban jata tha -> kabhi kabhi kisi aur ka
+      balance dikh jata tha / transfer galat account ka hota tha.
+   c) Game entry par balance read pehle hota tha aur wallet->game auto
+      transfer baad me -> game card purana (aksar 0) balance dikha deta
+      tha.
+
+   Fix:
+   - Login ab member ka existing valid token reuse karta hai (rotate
+     sirf expire/missing hone par). Sab devices par same token ->
+     balance har jagah same.
+   - Bina token ke API ab kabhi pehla user nahi banta - guest banta
+     hai. Transfer/Recharge-info jaise money endpoints guest ke liye
+     block kar diye ("Please login again"). Testing ke liye chahiye to
+     api_settings me allow_first_user_fallback = 1 karo (default 0).
+   - Game entry par pehle GetUserInfo (jo wallet->game auto-transfer
+     trigger karta hai) phir GetBalance chalta hai.
+   - wingo_auto_transfer ab default ON (1) hai: game khulte hi main
+     wallet ka poora paisa game wallet me shift ho jata hai, isliye
+     Wingo card hamesha full balance dikhata hai. Recharge ke baad bhi
+     game me paisa turant dikhega. Game se bahar aane par app ka
+     RecoverSaasBalance flow paisa wapas wallet me le aata hai.
+   - Auto-transfer ab hamesha hota hai (purana code game wallet >= 1.00
+     hone par skip kar deta tha, jisse naya recharge wallet me hi atka
+     rehta tha).
+
+INSTALL (cPanel)
+----------------
+1) ZIP ko public_html (ya jo site root hai) me EXTRACT karo.
+   Sirf ye files overwrite hongi:
+     - api/_bootstrap.php          (backend: issue/history/balance/token)
+     - js/BetRule-DyIqbhnc.js      (auto refresh after timer end)
+     - js/useWingo-C_0L1WoG.js     (fresh history on result animation)
+     - pwa-sw.js                   (cache version bump)
+     - version.json + index.html   (build version bump - open sessions
+                                    60 second ke andar khud update honge)
+     - 25L_WINGO_FIX_NOTES.txt     (ye file)
+2) Database ka kuch nahi karna - naye settings (wingo_auto_transfer
+   etc.) agle request par apne aap seed ho jate hain (INSERT IGNORE).
+3) Ek baar site kholo, login karo, Wingo 1M me 2 round dekho:
+   timer khatam hone ke ~2 second ke andar history me result aa jayega.
+
+NOTES
+-----
+- repair.php ab bhi repo me hai - use hata dena chahiye (DB credentials
+  plain text me hain). 13L notes me bhi likha tha.
+- Admin > Settings se wingo_balance_mode = total kar doge to game card
+  game+wallet dono jod kar dikhayega (default: game wallet, jo
+  auto-transfer ki wajah se already full hota hai).
+- Purana default registration bonus 4.45 abhi bhi waisa hi hai
+  (registration par game_balance 4.45). 0 karna ho to
+  api/_bootstrap.php me api_user_register ke INSERT me 4.45 -> 0.0
+  kar do.
