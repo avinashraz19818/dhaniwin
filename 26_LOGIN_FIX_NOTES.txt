@@ -1,0 +1,82 @@
+=====================================================================
+DHANIWIN - LOGIN FIX PACK  (v26 - 15 Sep 2026)
+Build: v26-login-fix-migrations
+=====================================================================
+
+KYA FIX HUA (What is fixed since v25)
+-------------------------------------
+
+v25 lagane ke baad kuch servers par login/register kaam nahi kar raha
+tha. Iska root cause trace karke 2 asli bugs fix kiye gaye hain
+(dono api/_bootstrap.php me):
+
+1) DATABASE MIGRATION KABHI RUN HI NAHI HOTI THI (sabse bada bug)
+   Problem: naye columns (referrer_id, status, vipLevel, payment_type
+   waghera) add karne wale ALTER statements code me ek EARLY RETURN ke
+   NICHE the. Real site par users table pehle se bani hoti hai, isliye
+   wo return pehle hi ho jata tha aur ye migrations kabhi chalti hi
+   nahi thi.
+
+   Nuksan: jab site SQLite (fallback/demo) database par chalti hai to
+   Register hamesha fail hota tha:
+     "Registration failed: table api_users has no column named
+      referrer_id"
+   -> Naya user register hi nahi kar pata tha.
+
+   Fix: saari migrations + default settings ab EARLY RETURN se PEHLE
+   chalti hain (har request par safe/idempotent - jo column pehle se
+   hai us par ALTER chup-chaap skip ho jata hai). Register/login ab
+   dono modes me kaam karta hai. 100% reproduce + verify kiya gaya hai.
+
+2) PHHP 8 FATAL ERROR - FRESH DATABASE PAR POORI SITE 500
+   Problem: api/_bootstrap.php me ek variable ($marker) bina define
+   kiye file_put_contents() ko diya gaya tha. PHP 8 me null filename
+   par TypeError aata hai jo @ se dabta NAHI hai -> fresh/empty
+   database par HAR request par fatal 500 (site poora down, login bhi).
+
+   Fix: $marker ab properly define hai (api/storage/.schema_done).
+
+3) DIAGNOSTIC: MySQL down hone par site CHUP-CHAAP SQLite demo
+   database par chalne lagti hai - is mode me asli members ka login
+   "User not found" dega kyunki wo demo DB me hote hi nahi.
+   Ab aisa hone par cPanel error log me ye line aayegi:
+
+     [dhaniwin] MySQL unavailable (...reason...) - falling back to
+     SQLite. Members cannot log in until MySQL is reachable again.
+
+   >>> AGAR LOGIN AB BHI NAHI HO RAHA: cPanel -> Metrics -> Errors
+   (ya error_log file) me upar wali line dhundho. Agar wo mil rahi hai
+   matlab MySQL connection ka problem hai (password/host/db name ya
+   MySQL service) - wo theek hote hi login wapas chal padega.
+
+Saath me v25 ke dono Wingo fixes bhi isi pack me hain:
+  - Timer khatam hote hi result history me apne aap aata hai
+  - Wingo balance sab devices/APK/Chrome par consistent
+
+INSTALL (cPanel)
+----------------
+1. WINgo_FIX_v26.zip ko public_html ke andar EXTRACT karo
+   (overwrite yes). Koi naya folder nahi banna chahiye - files seedha
+   public_html/api/... public_html/js/... me jani chahiye.
+2. Database me kuch karne ki zaroorat NAHI hai.
+3. Hard refresh / app me pull-to-refresh. Purane khule sessions
+   ~60 second me naye build par shift ho jate hain.
+
+FILES CHANGED
+-------------
+api/_bootstrap.php    -> migration-order fix, $marker fatal fix,
+                         MySQL-fallback logging (upar wale 3 points)
+index.html            -> build version bump (v26)
+version.json          -> build version bump (v26)
+js/BetRule-DyIqbhnc.js      -> (v25 se unchanged, history auto-refresh)
+js/useWingo-C_0L1WoG.js     -> (v25 se unchanged, balance/history fix)
+pwa-sw.js             -> (v25 se unchanged, cache v2)
+
+TESTING
+-------
+PHP 8.2.33 (WebAssembly runtime) par real backend chala kar verify:
+ - boot, Home/Register, Home/Login, re-login (stable token),
+   User/GetUserInfo, Lottery/GetBalance, Lottery/GetUserInfo (wingo
+   entry auto-transfer), bet guard, guest mode, fresh-database
+   creation, physical api/Home/Login.php router path - sab OK.
+=====================================================================

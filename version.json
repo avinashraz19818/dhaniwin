@@ -1,8 +1,8 @@
 {
-  "version": "1789412510000",
-  "timestamp": "1789412510000",
+  "version": "1789415100000",
+  "timestamp": "1789415100000",
   "buildEnv": "production",
   "buildMode": "production",
-  "buildId": "v25-wingo-history-autorefresh-balance",
-  "buildTime": "2026-09-14T19:00:00Z"
+  "buildId": "v26-login-fix-migrations",
+  "buildTime": "2026-09-15T12:00:00Z"
 }

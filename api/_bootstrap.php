@@ -195,6 +195,12 @@ function api_pdo(): ?PDO
     }
 
     if (!$pdo) {
+        if ($GLOBALS['db_connection_error'] !== '') {
+            // Make the silent fallback visible in the cPanel error log:
+            // if this appears, the site is serving the LOCAL SQLite demo
+            // database instead of MySQL -> members cannot log in.
+            error_log('[dhaniwin] MySQL unavailable (' . $GLOBALS['db_connection_error'] . ') - falling back to SQLite. Members cannot log in until MySQL is reachable again.');
+        }
         try {
             $sqlitePath = $db['sqlite_path'] ?? (__DIR__ . '/storage/dhaniwin.sqlite');
             $sqliteDir = dirname($sqlitePath);
@@ -304,6 +310,65 @@ function api_ensure_schema(PDO $pdo): void
                 PRIMARY KEY (admin_id, permission_id)
             )");
         }
+    } catch (Throwable $e) {}
+
+    // ------------------------------------------------------------------
+    // Idempotent migrations. They MUST run even when api_users already
+    // exists (i.e. on every real deployment). They previously lived below
+    // the "base schema already loaded" early return, so existing
+    // databases never received them. On the bundled SQLite database that
+    // left api_users without the referrer_id/status/vipLevel columns and
+    // Home/Register failed with "no column named referrer_id" whenever the
+    // site ran in SQLite fallback mode.
+    // ------------------------------------------------------------------
+    try {
+        api_set_default_settings($pdo);
+    } catch (Throwable $e) {
+        // api_settings does not exist yet; the full schema below will
+        // create it and the next request will seed the defaults.
+    }
+
+    try {
+        $stmt = $pdo->prepare("UPDATE api_settings SET setting_value = ? WHERE setting_key = 'share_domain' AND setting_value = 'https://dhaniwin7.com'");
+        $stmt->execute(['https://dhaniwin.club9.eu.cc']);
+    } catch (Throwable $e) {
+    }
+
+    // Alter table api_users to add missing columns if they don't exist
+    try {
+        $pdo->exec("ALTER TABLE api_users ADD COLUMN password VARCHAR(255) NULL");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE api_users ADD COLUMN token VARCHAR(255) NULL");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE api_users ADD COLUMN token_expire BIGINT NULL");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE api_users ADD COLUMN referrer_id BIGINT NULL");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE api_users ADD COLUMN status TINYINT(1) NOT NULL DEFAULT 1");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE api_users ADD COLUMN vipLevel INT NOT NULL DEFAULT 0");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE recharge_orders ADD COLUMN payment_type VARCHAR(20) NOT NULL DEFAULT 'UPI'");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE recharge_orders ADD COLUMN screenshot_url VARCHAR(255) NULL");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE withdraw_orders ADD COLUMN payment_type VARCHAR(20) NOT NULL DEFAULT 'UPI'");
+    } catch (Throwable $e) {}
+    try {
+        $pdo->exec("ALTER TABLE withdraw_orders ADD COLUMN remarks VARCHAR(255) NULL");
+    } catch (Throwable $e) {}
+
+    // Update password for default member to be 'admin123' if it's currently empty
+    try {
+        $pdo->exec("UPDATE api_users SET password = 'admin123' WHERE user_id = 132257 AND (password IS NULL OR password = '')");
     } catch (Throwable $e) {}
 
     // Check if base schema is already loaded
@@ -1090,6 +1155,9 @@ function api_ensure_schema(PDO $pdo): void
         }
     } catch (Throwable $e) {}
 
+    // $marker was never defined, so on a brand-new database this raised a
+    // PHP 8 TypeError (null filename) and killed EVERY request with a 500.
+    $marker = api_storage_dir() . '/.schema_done';
     @file_put_contents($marker, '1');
     $done[$key] = true;
 }
