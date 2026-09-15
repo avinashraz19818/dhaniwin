@@ -78,7 +78,7 @@ function ut(a) {
         loop: !0,
         volume: 1,
         preload: !1
-    }) : null, I = L(!1), C = L(!1), b = L(!1), _ = L(), d = new Map, wlBusy = !1, wlFallbk = !1, wlShown = new Set, q = n(() => t.issue), j = n(() => t.issueData || {}), A = n(() => ({
+    }) : null, I = L(!1), C = L(!1), b = L(!1), _ = L(), d = new Map, wlBusy = !1, wlFallbk = !1, wlShown = new Set, wlHeal = null, q = n(() => t.issue), j = n(() => t.issueData || {}), A = n(() => ({
         interval: t.interval || 0,
         ...xe(t.countdown * 1e3)
     })), z = n(() => {

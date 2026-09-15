@@ -1,0 +1,35 @@
+=====================================================================
+DHANIWIN - FIX PACK v31  (16 Sep 2026)   [v30 KO SKIP KAREIN]
+Build: v31-load-fix
+=====================================================================
+
+!!! v30 me ek critical bug tha (game page blank load hota tha) -
+!!! ye v31 usko fix karta hai. v30 use NA karein, seedha v31 lagayein.
+
+v31 me kya hua
+--------------
+- v30 ke watchdog code me ek variable (wlHeal) declare nahi tha ->
+  ES module strict mode me ReferenceError -> WinGo page mount hote hi
+  crash -> screen blank. Ab variable properly declared hai.
+- Static analysis checker se verify: koi undeclared assignment nahi.
+- Watchdog (timer self-heal) ab sahi chalta hai: worker pause ho to
+  2-4s me resume + refetch retry.
+
+Iske alawa sab included (v25-v29):
+- timer end ke ~1s me result history (400ms poller)
+- win/loss popup (retry + backend fallback)
+- period numbering 1-period-piche
+- login fixes, balance fixes
+- .htaccess no-cache (zip me shamil)
+
+INSTALL
+-------
+1. WINgo_FIX_v31.zip -> public_html me extract (overwrite ALL).
+2. Chrome/app ko recent apps se PURA band karke dobara kholo.
+3. Game load hoga, timer chalega; koi hiccup aaye to watchdog khud
+   theek karega.
+
+FILES (8): .htaccess, api/_bootstrap.php, js/BetRule-DyIqbhnc.js,
+js/useWingo-C_0L1WoG.js, pwa-sw.js, version.json, index.html,
+WINgo_v31_NOTES.txt
+=====================================================================
