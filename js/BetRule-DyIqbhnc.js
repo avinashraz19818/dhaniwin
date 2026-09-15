@@ -135,7 +135,7 @@ function ut(a) {
     }), E = n(() => t.historyIssues), ie = n(() => t.historyIssuesTotalPage), {
         pause: g,
         resume: ce
-    } = Fe(async () => {
+    , isActive: wlAct } = Fe(async () => {
         var e, s;
         if (t.countdown < 1) {
             g();
@@ -217,11 +217,16 @@ function ut(a) {
                 gameCode: c.value,
                 lotteryCode: v.value
             }, !0);
-            if (!s && !i.current) return g();
+            if (!s && !i.current) {
+                g();
+                setTimeout(wlHeal, 2e3);
+                return
+            }
             const r = ye(u || i);
             t.issueData = r, t.interval = r.intervalMinute, await P(r)
         } catch {
-            g()
+            g();
+            setTimeout(wlHeal, 2e3)
         } finally {
             b.value = !1
         }
@@ -390,6 +395,24 @@ function ut(a) {
         e === "hidden" ? g() : setTimeout(async () => {
             await S(!0), await B()
         }, 100)
+    }), wlHeal = () => {
+        // v30: self-heal. If the countdown worker is paused while the page
+        // is visible (a failed issue refetch used to leave it paused
+        // FOREVER - "timer ruka hua"), resume it and retry the refetch.
+        try {
+            if (wlAct.value) return;
+            if (typeof document > "u" || document.visibilityState !== "visible") return;
+            ce(), S(!0)
+        } catch (e2) {}
+    }, H(wlAct, e2 => {
+        // watchdog: check every few seconds; heal runs on pause only.
+        if (e2) return;
+        setTimeout(wlHeal, 4e3)
+    }, {
+        immediate: !1
+    }), H(() => t.countdown, e2 => {
+        // if we are paused mid-count (not at the switch boundary), heal too.
+        if (!wlAct.value && typeof document < "u" && document.visibilityState === "visible" && e2 > 1) setTimeout(wlHeal, 1500)
     }), {
         betScopes: ee,
         betMultiples: te,

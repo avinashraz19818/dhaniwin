@@ -1,0 +1,49 @@
+=====================================================================
+DHANIWIN - FIX PACK v30  (16 Sep 2026)
+Build: v30-timer-watchdog
+=====================================================================
+
+v30 me kya fix hua
+------------------
+
+TIMER FREEZE FIX ("timer ruka hua")
+Countdown worker kabhi-kabhi PAUSE ho jata tha (network hiccup, app
+background se wapas aana, ya issue-refetch fail hona) aur purane code
+me resume karne ka koi raasta NAHI tha - timer wahin ruk jata tha.
+
+Ab SELF-HEAL watchdog hai (js/BetRule-DyIqbhnc.js):
+- worker pause hote hi (page visible hai to) 2-4 second ke andar
+  countdown resume + issue refetch retry hota hai
+- refetch fail hone par bhi 2s baad retry
+- matlab timer ab AAGE SE freeze NAHI hoga; koi hiccup aaye to khud
+  theek ho jayega
+
+Baaki sab v29 wala bana hua hai:
+- result history timer end ke ~1s andar (400ms poller)
+- win/loss popup robust (retry + backend fallback + dedupe)
+- period numbering 1-period-piche (v27)
+- login fixes (v26), balance fixes (v25)
+- .htaccess me js/css no-cache (v29) - isi zip me dobara shamil
+
+INSTALL (cPanel)
+----------------
+1. WINgo_FIX_v30.zip ko public_html me EXTRACT karo (overwrite ALL -
+   .htaccess samet).
+2. Database me kuch nahi karna.
+3. Phone par Chrome/APK PURI TARAH BAND karke dobara kholo
+   (recent apps se swipe karke band karo) taaki naya JS load ho.
+
+AGAR TIMER PHIR BHI RUKE (unlikely):
+- Page par pull-to-refresh / reload karke dekho - kya timer chalta hai?
+- Chrome DevTools (desktop) me Console/Network me koi red error ho to
+  screenshot bhejo. Watchdog ki wajah se ruka hua timer 4s me khud
+  theek hona chahiye.
+
+FILES (8)
+---------
+js/BetRule-DyIqbhnc.js      -> watchdog + retry + v29 poller/popup
+.htaccess                   -> js/css no-cache (v29 se)
+api/_bootstrap.php          -> period lag + login fixes
+js/useWingo-C_0L1WoG.js     -> reveal fresh fetch
+pwa-sw.js, index.html, version.json -> build v30 stamp
+=====================================================================

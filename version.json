@@ -1,8 +1,8 @@
 {
-  "version": "1789445800000",
-  "timestamp": "1789445800000",
+  "version": "1789447600000",
+  "timestamp": "1789447600000",
   "buildEnv": "production",
   "buildMode": "production",
-  "buildId": "v29-fast-popup",
-  "buildTime": "2026-09-15T22:00:00Z"
+  "buildId": "v30-timer-watchdog",
+  "buildTime": "2026-09-15T23:00:00Z"
 }
