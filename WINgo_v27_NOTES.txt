@@ -1,0 +1,58 @@
+=====================================================================
+DHANIWIN - FIX PACK v27  (15 Sep 2026)
+Build: v27-restore-1-period-lag
+=====================================================================
+
+v27 me kya badla (since v26)
+----------------------------
+PERIOD NUMBERING WAPAS PURANI TARAH "1 PERIOD PICHE" KAR DIYA GAYA.
+v25/v26 me betting issue current window ka ho gaya tha (1 period aage)
+- owner ko wo pasand nahi tha. Ab wapas wahi behaviour hai:
+
+  - Clock window W chal rahi hai -> betting issue = W-1 (1 period piche)
+  - History ki top row bhi W-1 (uska result generated)
+  - Timer khatam hote hi betting W par shift hota hai aur history me
+    NAYI row (W, result ke saath) apne aap aa jati hai - refresh ki
+    zaroorat NAHI (ye auto-update frontend fix v27 me bhi bana hua hai)
+
+Iske alawa v26 ke login fixes aur v25 ke Wingo fixes sab included hain.
+
+LOGIN FIXES (v26 se, isi pack me shamil)
+----------------------------------------
+1) DB migrations (referrer_id, status, vipLevel, payment_type columns +
+   default settings) ab har boot par chalti hain - pehle ek early-return
+   ke neeche thi aur kabhi run nahi hoti thi. SQLite fallback mode me
+   Register "no column named referrer_id" se fail hota tha. FIX.
+2) PHP 8 fatal error (undefined $marker -> file_put_contents(null))
+   fresh database par HAR request ko 500 deta tha. FIX.
+3) MySQL connection fail hone par site chup-chaap SQLite demo DB par
+   chalti hai - ab cPanel error log me ye line aati hai:
+     [dhaniwin] MySQL unavailable (...) - falling back to SQLite...
+   >>> Login ab bhi na ho to cPanel -> Errors me ye line dhundho;
+   matlab MySQL connection ka problem hai.
+
+WINGO FIXES (v25 se, isi pack me shamil)
+----------------------------------------
+- Timer khatam hote hi result game history me APNE AAP aata hai
+  (js/BetRule + js/useWingo me auto-refresh timers; purana websocket
+  dependency hata diya tha jo kabhi connect hi nahi hota tha).
+- Wingo balance sab devices/APK/Chrome par consistent:
+  stable member token, game-entry par wallet auto-transfer,
+  guest-mode me money endpoints protected.
+
+INSTALL (cPanel)
+----------------
+1. WINgo_FIX_v27.zip ko public_html me EXTRACT karo (overwrite).
+   Files seedha public_html/api/... aur public_html/js/... me jaani
+   chahiye - koi extra folder nahi.
+2. Database me kuch nahi karna.
+3. Khule sessions ~60s me naye build par shift ho jate hain.
+
+FILES
+-----
+api/_bootstrap.php          -> period lag restore + v26 login fixes
+js/BetRule-DyIqbhnc.js      -> history/issue auto-refresh timers
+js/useWingo-C_0L1WoG.js     -> reveal par fresh data fetch
+pwa-sw.js                   -> cache bust v2
+index.html, version.json    -> build v27 stamp
+=====================================================================

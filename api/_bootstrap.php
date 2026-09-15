@@ -2399,18 +2399,18 @@ function api_lottery_issue_data(string $gameCode): array
     $start = (int) (floor($now / $periodMs) * $periodMs);
     $end = $start + $periodMs;
 
-    // The betting issue is the issue that belongs to the CURRENT window.
-    // (Old builds lagged one period behind: the issue shown for betting was the
-    // same one already sitting on top of the history list with its result
-    // pre-generated. That meant the result was visible BEFORE the round ended
-    // and, when the timer hit zero, no new row ever appeared in the game
-    // history - users had to refresh the page to see a "new" result.
-    // With the current-window issue the contract matches the frontend:
-    //   - while betting on issue W, history top = W-1 (last finished round)
-    //   - the moment the timer ends, history top becomes W (result appears
-    //     automatically, no refresh needed) and betting moves to W+1.)
-    $issue = api_lottery_calculate_issue($gameCode, (int)($start / 1000));
-    $nextIssue = api_lottery_calculate_issue($gameCode, (int)($end / 1000));
+    // 1-period lag offset behind upstream (owner-confirmed behaviour, v26):
+    // while the clock window is W, the issue open for betting is W-1 and the
+    // history top row is also W-1 (result generated for it). When the timer
+    // ends, betting moves to W and a new top row (W, with result) appears.
+    // The v25 experiment advanced the betting issue to the current window,
+    // but that shifted every visible period number by one - reverted here.
+    // The "result appears automatically at timer end" fix lives in the
+    // frontend (js/BetRule-*.js auto-refresh timers) and keeps working:
+    // it simply re-fetches issue data + history when the countdown ends.
+    $lagStart = $start - $periodMs;
+    $issue = api_lottery_calculate_issue($gameCode, (int)($lagStart / 1000));
+    $nextIssue = api_lottery_calculate_issue($gameCode, (int)($start / 1000));
     $secondsLeft = max(0, (int) ceil(($end - $now) / 1000));
     $isLocked = ($secondsLeft <= 5);
     
