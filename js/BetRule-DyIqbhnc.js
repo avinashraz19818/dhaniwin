@@ -301,16 +301,25 @@ function ut(a) {
             }
         }
     }, Ae = async () => {
-        // ---- v29: win/loss popup, robust + fast -------------------------
-        // Fires a few times after every period switch (see P()). Rules:
-        //  - oldest pending bet first: that is the round that just ended;
-        //  - index 0/1 in history = just-ended round (the fresh issue takes
-        //    the top row at the switch); index > 1 = stale -> drop it;
-        //  - wlShown stops the retry timers from double-opening one result;
-        //  - if the in-memory bet map is empty (page reload mid-round or a
-        //    WebView dropping page state) fall back to the backend's latest
-        //    settled bet for this member - but only for a bet whose issue is
-        //    one of the two newest history rows, so an old bet never pops.
+        // ---- v33: win/loss popup — ONLY at timer end, slip always filled --
+        // v32 bug: the backend instant-settles a bet the second it is placed,
+        // so "a settled bet exists" fired the popup RIGHT AFTER BETTING (while
+        // the round was still open), and when the in-memory history list did
+        // not contain that issue yet (findIndex === -1 slipped past the old
+        // "> 1" guard) the popup opened with result:null = empty white slip.
+        // Rules now:
+        //  - NEVER pop for the issue that is still open (s === t.issue); the
+        //    popup may only appear after that round's timer has ended;
+        //  - the popped issue must already be a finished history row (index
+        //    0/1). If it is not in history YET (index -1) keep the bet and
+        //    retry on the next poll - do not pop, do not drop;
+        //  - index > 1 = too old, drop it (no surprise popups for old rounds);
+        //  - slip data (number/color) always comes from that history row; if
+        //    the in-memory list misses it, re-pull history once first;
+        //  - wlShown stops retry timers from double-opening one result;
+        //  - empty bet map (page reload mid-round): fall back to the member's
+        //    latest settled bet, same gates (not the open issue, present in
+        //    the newest history rows).
         if (wlBusy) return;
         wlBusy = !0;
         try {
@@ -318,7 +327,10 @@ function ut(a) {
             const e = [...d.keys()];
             if (e.length) {
                 s = e[0];
-                if (E.value.findIndex(N => N.issueNumber === s) > 1) {
+                if (s === t.issue) return;
+                const wlIdx = E.value.findIndex(N => N.issueNumber === s);
+                if (wlIdx === -1) return;
+                if (wlIdx > 1) {
                     d.delete(s);
                     return
                 }
@@ -328,10 +340,11 @@ function ut(a) {
                 const f = await Ze({});
                 if (!f || !f.result || !f.data || !f.data.issueNumber) return;
                 if (f.data.state === "none" || f.data.isPending) return;
-                if (wlShown.has(f.data.issueNumber)) return;
-                const fb = E.value.findIndex(N => N.issueNumber === f.data.issueNumber);
-                if (fb !== 0 && fb !== 1) return;
-                s = f.data.issueNumber
+                s = f.data.issueNumber;
+                if (s === t.issue) return;
+                if (wlShown.has(s)) return;
+                const fb = E.value.findIndex(N => N.issueNumber === s);
+                if (fb === -1 || fb > 2) return
             }
             if (!s || wlShown.has(s)) {
                 d.delete(s);
@@ -344,13 +357,18 @@ function ut(a) {
                 issueNumber: s
             });
             if (!i) return;
-            if (r.status === null) {
-                d.delete(s);
+            if (r.isPending || r.state === "pending" || r.state === "none") {
+                r.state === "none" && d.delete(s);
                 return
             }
+            let M = E.value.find(N => N.issueNumber === s);
+            if (!M) {
+                await B();
+                M = E.value.find(N => N.issueNumber === s)
+            }
+            if (!M) return;
             if (J(), d.delete(s), !_.value) return;
-            const x = r.status === !0,
-                M = E.value.find(N => N.issueNumber === s);
+            const x = r.status === !0;
             wlShown.add(s);
             _.value.open({
                 isWin: x,

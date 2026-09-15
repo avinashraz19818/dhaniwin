@@ -64,7 +64,7 @@ export const a = () => ({
   webSocketUrl: '',
 });
 export const d = async () => ({ result: true, data: { current: { issueNumber: '20260915100050999', startTime: Date.now(), endTime: Date.now() + 30000 }, intervalMinute: 0.5, gameCode: 'WinGo_30S' } });
-export const e = async () => ({ result: true, data: { list: [{ issueNumber: '20260915100050999', number: '5' }, { issueNumber: '20260915100050998', number: '3' }], totalPage: 1 } });
+export const e = async () => ({ result: true, data: { list: [{ issueNumber: '20260915100050999', number: '5', color: 'red' }, { issueNumber: '20260915100050998', number: '3', color: 'green' }], totalPage: 1 } });
 export const f = async (p) => ({ result: true, data: { status: true, winAmount: 7.5, issueNumber: (p && p.issueNumber) || 'x' } });
 export const h = async () => ({ result: false });
 export const i = async () => ({ result: false });

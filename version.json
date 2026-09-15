@@ -1,8 +1,8 @@
 {
-  "version": "1789449800000",
-  "timestamp": "1789449800000",
+  "version": "1789453400000",
+  "timestamp": "1789453400000",
   "buildEnv": "production",
   "buildMode": "production",
-  "buildId": "v32-final-const-fix",
-  "buildTime": "2026-09-16T01:00:00Z"
+  "buildId": "v33-popup-timer-gate",
+  "buildTime": "2026-09-16T02:30:00Z"
 }

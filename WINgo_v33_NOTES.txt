@@ -1,0 +1,40 @@
+WINgo FIX v33 — popup timing + slip fix (final over v32)
+=========================================================
+Stamp: 1789453400000 / v33-popup-timer-gate
+
+PROBLEM (round 10 screenshot)
+- Popup bet lagate hi aa raha tha (round khatam hone se PEHLE).
+- Popup me white slip khali thi (number/color/bet detail nahi).
+
+ROOT CAUSE
+- Backend "instant settle" har bet ko lagte hi settle kar deta hai, isliye
+  "settled bet exists" check popup ko turant trigger kar raha tha.
+- Purana guard history check me -1 (not found) ko pass kar deta tha, isliye
+  popup result:null ke saath khulta tha = khali slip.
+
+FIX (sirf js/BetRule-DyIqbhnc.js badla hai)
+- Popup AB sirf tab khulega jab us issue ka timer KHATAM ho chuka ho
+  (current open issue ke liye popup never).
+- Popup wala issue history me finished row (index 0/1) hona zaroori hai;
+  abhi history me nahi aaya to retry, pop nahi.
+- Slip data (number/color) hamesha us history row se aata hai; memory me
+  row na ho to history ek baar re-pull hoti hai. Empty slip impossible.
+- Timer end ke ~1s andar result + popup (v29 poller unchanged).
+- Baaki sab v32 jaisa: timer self-heal watchdog, 1-period-piche numbering,
+  login/balance fixes, .htaccess no-cache.
+
+VERIFY (machine par, bhejne se pehle)
+- Node execution harness: game mount + ticks OK.
+- NAYA behaviour test (tmp/fx-harness/run2.mjs):
+  * round open hai + bet lagi -> popup NAHI khulta  [v32 is test me FAIL:
+    popup round ke beher me + result:null = aapka screenshot]
+  * timer end -> exactly 1 popup, slip bhari hui (number+color).
+- Static syntax check clean; backend boot code=0 + login handler OK.
+
+INSTALL
+1. ZIP ke saare files public_html par OVERWRITE extract karo.
+2. Chrome/app ko recent apps se pura band karke dobara kholo.
+3. Bet lagao -> timer end hone par hi popup aayega, bhari hui slip ke saath.
+
+Files: .htaccess, api/_bootstrap.php, js/BetRule-DyIqbhnc.js,
+js/useWingo-C_0L1WoG.js, pwa-sw.js, version.json, index.html, ye notes.
