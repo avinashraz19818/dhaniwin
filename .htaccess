@@ -22,6 +22,13 @@ RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
     Header set Pragma "no-cache"
     Header set Expires "0"
   </FilesMatch>
+  # v29: JS/CSS are hot-fixed in place (same filenames), so browsers and
+  # especially APK WebViews must REVALIDATE them on every page load.
+  # Without this, heuristic HTTP caching kept serving the OLD game files
+  # for hours and fixes "never reached" the player's device.
+  <FilesMatch "\.(js|css)$">
+    Header set Cache-Control "no-cache, must-revalidate"
+  </FilesMatch>
 </IfModule>
 
 # ------------------------------

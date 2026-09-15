@@ -78,7 +78,7 @@ function ut(a) {
         loop: !0,
         volume: 1,
         preload: !1
-    }) : null, I = L(!1), C = L(!1), b = L(!1), _ = L(), d = new Map, wlBusy = !1, q = n(() => t.issue), j = n(() => t.issueData || {}), A = n(() => ({
+    }) : null, I = L(!1), C = L(!1), b = L(!1), _ = L(), d = new Map, wlBusy = !1, wlFallbk = !1, wlShown = new Set, q = n(() => t.issue), j = n(() => t.issueData || {}), A = n(() => ({
         interval: t.interval || 0,
         ...xe(t.countdown * 1e3)
     })), z = n(() => {
@@ -166,9 +166,30 @@ function ut(a) {
         // zero, so re-pull the history (and the member's win/loss + balance)
         // a moment after every issue switch. B = getHistoryIssues,
         // Ae = getWinLossResult (both defined further down in this scope).
+        // v29: the 1-period-lag engine has the finished round's result READY
+        // the instant the timer hits zero. Instead of fixed 1.5-4.2s delays
+        // (v25-v28, perceived as "~5 sec baad result"), poll every 400ms:
+        // re-pull history until the NEW issue becomes the top row, then fire
+        // the win/loss popup at once. Normally done within ~0.5-1s.
+        wlFallbk = !1;
         try {
-            setTimeout(() => { try { B() } catch (e2) {} }, 1500);
-            setTimeout(() => { try { B(), Ae() } catch (e2) {} }, 4200);
+            const wlNew = e.issueNumber;
+            let wlTries = 0;
+            const wlPoll = () => {
+                try {
+                    wlTries++;
+                    const wlTop = (t.historyIssues && t.historyIssues[0]) || null;
+                    if (wlTop && wlTop.issueNumber === wlNew) {
+                        Ae();
+                        setTimeout(() => { try { Ae() } catch (e4) {} }, 1500);
+                        return
+                    }
+                    B();
+                    if (wlTries < 15) setTimeout(wlPoll, 400);
+                    else Ae()
+                } catch (e2) {}
+            };
+            setTimeout(wlPoll, 350);
         } catch (e3) {}
     }, me = () => {
         t.sound = !t.sound
@@ -267,31 +288,42 @@ function ut(a) {
             }
         }
     }, Ae = async () => {
-        // ---- v28: win/loss popup fix -----------------------------------
-        // The popup never appeared because:
-        //  (1) After the period switch the NEW issue becomes history top,
-        //      so the issue the player bet on sits at index 1. The old
-        //      "> 0" check treated that as "too old", cleared the bet map
-        //      and returned BEFORE calling GetWinLossResult - popup dead.
-        //      On this engine index <= 1 means "the round that just ended".
-        //  (2) The reveal-sound callback and the auto-refresh timers both
-        //      call this function within ~2s of each other; the lock below
-        //      keeps it to one popup per result.
+        // ---- v29: win/loss popup, robust + fast -------------------------
+        // Fires a few times after every period switch (see P()). Rules:
+        //  - oldest pending bet first: that is the round that just ended;
+        //  - index 0/1 in history = just-ended round (the fresh issue takes
+        //    the top row at the switch); index > 1 = stale -> drop it;
+        //  - wlShown stops the retry timers from double-opening one result;
+        //  - if the in-memory bet map is empty (page reload mid-round or a
+        //    WebView dropping page state) fall back to the backend's latest
+        //    settled bet for this member - but only for a bet whose issue is
+        //    one of the two newest history rows, so an old bet never pops.
         if (wlBusy) return;
-        const e = [...d.keys()];
-        if (!e.length) return;
-        // Oldest pending bet first: it is the round that just ended. (Taking
-        // the newest one pops the still-open round when the player bet on two
-        // consecutive rounds.)
-        const s = e[0];
-        // Drop only truly stale issues (2+ rounds old); keep newer pending
-        // bets in the map so their popup fires at their own round end.
-        if (E.value.findIndex(N => N.issueNumber === s) > 1) {
-            d.delete(s);
-            return
-        }
         wlBusy = !0;
         try {
+            let s = "";
+            const e = [...d.keys()];
+            if (e.length) {
+                s = e[0];
+                if (E.value.findIndex(N => N.issueNumber === s) > 1) {
+                    d.delete(s);
+                    return
+                }
+            } else {
+                if (wlFallbk) return;
+                wlFallbk = !0;
+                const f = await Ze({});
+                if (!f || !f.result || !f.data || !f.data.issueNumber) return;
+                if (f.data.state === "none" || f.data.isPending) return;
+                if (wlShown.has(f.data.issueNumber)) return;
+                const fb = E.value.findIndex(N => N.issueNumber === f.data.issueNumber);
+                if (fb !== 0 && fb !== 1) return;
+                s = f.data.issueNumber
+            }
+            if (!s || wlShown.has(s)) {
+                d.delete(s);
+                return
+            }
             const {
                 result: i,
                 data: r
@@ -306,13 +338,13 @@ function ut(a) {
             if (J(), d.delete(s), !_.value) return;
             const x = r.status === !0,
                 M = E.value.find(N => N.issueNumber === s);
-            if (!M) return;
+            wlShown.add(s);
             _.value.open({
                 isWin: x,
                 amount: r.winAmount || 0,
                 issueNumber: s,
-                result: M
-            }), d.delete(s), x && R()
+                result: M || null
+            }), x && R()
         } catch {} finally {
             wlBusy = !1
         }

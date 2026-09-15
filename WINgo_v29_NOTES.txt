@@ -1,0 +1,61 @@
+=====================================================================
+DHANIWIN - FIX PACK v29  (15 Sep 2026)
+Build: v29-fast-popup
+=====================================================================
+
+v29 me kya fix hua
+------------------
+
+1) RESULT HISTORY AB TURANT AATA HAI (5 second ka lag khatam)
+   Pehle timer khatam hone ke baad fixed 1.5s-4.2s delays se history
+   update hoti thi (isi liye ~5 second baad result dikhta tha).
+   Ab: timer zero hote hi har 400ms par history check hoti hai aur
+   JISE HI nayi period ki row top par aati hai, UI update ho jata hai.
+   1-period-piche engine me result pehle se ready hota hai, isliye ye
+   sab normally 0.5-1 second ke andar ho jata hai.
+
+2) WIN/LOSS POPUP - AB HAR SURAT ME AAYEGA
+   - Popup check ab switch ke baad kai baar try hota hai (pehle sirf
+     ek baar try hota tha aur fail ho jata tha to kabhi nahi aata tha).
+   - Naya FALLBACK: agar kisi wajah se page ka bet-record khoya ho
+     (page reload, APK WebView state reset), to backend se member ki
+     latest settled bet poochh kar popup dikhaya jata hai - lekin SIRF
+     agar wo bet pichhli 2 rows me hai (purani bet ka popup kabhi nahi).
+   - Ek hi result par double popup na aaye iska lock + dedupe hai.
+
+3) APK/BROWSER CACHE FIX (sabse zaroori!)
+   .htaccess me js/css files ke liye "no-cache, must-revalidate" add
+   kiya hai. Pehle APK WebViews/browser purani JS files ghanton tak
+   cache se serve karte the - isliye fix upload karne ke baad bhi
+   "same hi chal raha tha". Ab har page load par files revalidate hongi
+   aur naya code TURANT device tak pahunchega.
+   >>> ISI LIYE IS ZIP ME .htaccess BHI HAI - OVERWRITE ZAROOR HONA
+   CHAHIYE.
+
+4) Period numbering 1-period-piche hi hai (v27 wala), login fixes
+   (v26) aur balance fixes (v25) bhi included hain.
+
+INSTALL (cPanel) - dhyan se
+---------------------------
+1. WINgo_FIX_v29.zip ko public_html me EXTRACT karo (overwrite ALL).
+   Is baar .htaccess bhi zip me hai - uska overwrite hona zaroori hai.
+2. Database me kuch nahi karna.
+3. Phone/APK me ek baar app band karke dobara kholo (ya hard refresh)
+   taaki naya .htaccess effect me aaye. Uske baad har load fresh hoga.
+
+FILES (8)
+---------
+.htaccess                   -> js/css no-cache revalidation (v29)
+js/BetRule-DyIqbhnc.js      -> fast poller + robust popup logic
+api/_bootstrap.php          -> (v27/v26 fixes, unchanged)
+js/useWingo-C_0L1WoG.js     -> (reveal par fresh fetch, unchanged)
+pwa-sw.js                   -> cache bust v2
+index.html, version.json    -> build v29 stamp
+
+TESTING
+-------
+- Popup logic ke 6 scenarios unit-tested: just-ended bet (win/loss),
+  reload-fallback, stale-bet skip, no-bet skip, retry dedupe,
+  stale mapBet drop - sab sahi.
+- PHP syntax + full backend boot PHP 8.2.33 runtime me verify.
+=====================================================================
