@@ -73,12 +73,20 @@ function ut(a) {
         introduceHtml: void 0,
         historyIssues: [],
         historyIssuesTotalPage: 0
-    }), l = a != null && a.bg ? new Ne.Howl({
+    });
+    // v32: these MUST be mutable - they are reassigned at runtime (Ae lock,
+    // fallback flag, heal fn). They were previously inside the giant const
+    // chain below, so every reassignment threw
+    // "TypeError: Assignment to constant variable" - that one bug froze the
+    // countdown (v29/v30) and then blanked the whole game page (v30/v31).
+    let wlBusy = !1, wlFallbk = !1, wlHeal = null;
+    const wlShown = new Set;
+    const l = a != null && a.bg ? new Ne.Howl({
         src: a != null && a.bg ? [a.bg] : [],
         loop: !0,
         volume: 1,
         preload: !1
-    }) : null, I = L(!1), C = L(!1), b = L(!1), _ = L(), d = new Map, wlBusy = !1, wlFallbk = !1, wlShown = new Set, wlHeal = null, q = n(() => t.issue), j = n(() => t.issueData || {}), A = n(() => ({
+    }) : null, I = L(!1), C = L(!1), b = L(!1), _ = L(), d = new Map, q = n(() => t.issue), j = n(() => t.issueData || {}), A = n(() => ({
         interval: t.interval || 0,
         ...xe(t.countdown * 1e3)
     })), z = n(() => {

@@ -1,0 +1,51 @@
+=====================================================================
+DHANIWIN - FINAL FIX PACK v32  (16 Sep 2026)
+Build: v32-final-const-fix
+[v29/v30/v31 ko skip karein - ye final pack hai]
+=====================================================================
+
+SABSE BADA ROOT CAUSE (jo v29-v31 me dikkat deta raha)
+------------------------------------------------------
+Mere kuch JS fixes ke variables (wlBusy, wlFallbk, wlHeal) galti se ek
+bade "const" declaration ke andar declare ho gaye the. Runtime par unko
+update karne par "TypeError: Assignment to constant variable" aata tha:
+  - timer switch par ye error aata -> countdown freeze (v29/v30)
+  - page mount par ye error aata -> pura game blank (v30/v31)
+
+v32 me ye variables alag "let" statement me declare hain. Ab koi
+const-reassignment crash NAHI hai.
+
+VERIFY KAISE HUA (is baar phone se pehle machine par)
+-----------------------------------------------------
+Ek execution harness banaya gaya jo asli patched JS files ko Node me
+Vue/DOM stubs ke saath CHALATA hai - page mount + countdown ticks +
+issue switch + popup flow sab simulate hota hai:
+  - v31 file harness me wahi crash deti hai jo phone par aaya
+    ("Assignment to constant variable")
+  - v32 file: BetRule store setup OK, useWingo (WinGo page) setup OK,
+    ticks OK, switch OK, popup flow OK
+  - static undeclared-assignment checker bhi clean
+
+V32 ME SAB KUCH (final state)
+-----------------------------
+1. Timer kabhi freeze nahi hoga - self-heal watchdog (pause ho to
+   2-4s me resume + refetch retry)
+2. Timer end hote hi ~1s me result history me (400ms poller)
+3. Win/loss popup timer end par (retry + backend fallback + dedupe)
+4. Period numbering 1-period-piche (owner pasand)
+5. Login fixes (migrations, PHP8 fatal, MySQL fallback log)
+6. Balance consistency fixes
+7. .htaccess no-cache (zip me)
+
+INSTALL
+-------
+1. WINgo_FIX_v32.zip -> public_html me extract (overwrite ALL).
+2. Chrome/app ko recent apps se PURA band karo, dobara kholo.
+3. Game load hoga, timer chalega, result + popup aayega.
+
+Koi dikkat dikhe to screenshot + Chrome console error bhejo.
+
+FILES (8): .htaccess, api/_bootstrap.php, js/BetRule-DyIqbhnc.js,
+js/useWingo-C_0L1WoG.js, pwa-sw.js, version.json, index.html,
+WINgo_v32_NOTES.txt   (+ repo me dev harness: tmp/fx-harness/)
+=====================================================================
