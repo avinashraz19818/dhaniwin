@@ -1,0 +1,59 @@
+=====================================================================
+DHANIWIN - FIX PACK v28  (15 Sep 2026)
+Build: v28-winloss-popup
+=====================================================================
+
+v28 me kya fix hua (since v27)
+------------------------------
+WIN/LOSS POPUP: timer khatam hone ke baad ab win/loss popup aayega.
+Pehle popup kabhi khul hi nahi raha tha.
+
+Root cause: popup ka logic (js/BetRule-DyIqbhnc.js me getWinLossResult)
+ye check karta tha ki bet wali period history ki SABSE TOP row par hai
+ya nahi. Is site ke engine me timer khatam hote hi NAYI period top par
+aa jati hai, isliye bet wali period index-1 par chali jati thi -> purana
+check ("> 0") bet ko "purana" samajh kar delete kar deta tha aur API call
+kabhi hoti hi nahi thi -> popup kabhi nahi aata tha.
+
+Fix (3 cheezein):
+1. Check ko engine ke hisaab se adjust kiya: ab index 0 ya 1 dono par
+   popup trigger hota hai (matlab "abhi-abhi khatam hui round"). 2+
+   round purani bet par popup skip hi hota hai (wahi purana safety).
+2. Popup lock: reveal-animation aur auto-refresh timer dono ek saath
+   check karte the -> duplicate popup ka race tha. Ab ek result par
+   sirf ek popup.
+3. Lagatar 2 round par bet lagane par ab dono ka popup unke apne timer
+   end par aata hai (pehle dusri bet ka record clear ho jata tha).
+
+Backend (Lottery/GetWinLossResult) already sahi result de raha tha -
+status/winAmount turant milta hai (instant settle). Koi backend change
+is version me nahi hai.
+
+Pichhle sab fixes bhi isi pack me hain:
+- v27: period numbering "1 period piche" (owner pasand) + timer end par
+  history me result apne aap aana
+- v26: login fixes (migrations order, PHP8 fatal, MySQL fallback log)
+- v25: Wingo balance consistency
+
+INSTALL (cPanel)
+----------------
+1. WINgo_FIX_v28.zip ko public_html me EXTRACT karo (overwrite).
+2. Database me kuch nahi karna.
+3. Khule sessions ~60s me naye build par shift ho jate hain.
+
+TESTING
+-------
+- Patched getWinLossResult function ko asli stubs ke saath unit-test
+  kiya: single bet win/loss, lagatar 2 bets, stale-bet skip, duplicate
+  call race - sab sahi.
+- Backend GetWinLossResult real PHP 8.2 runtime me verify: bet lagane
+  ke baad status + winAmount turant milta hai.
+
+FILES
+-----
+js/BetRule-DyIqbhnc.js      -> win/loss popup fix (upar wala)
+api/_bootstrap.php          -> (v27 se unchanged: period lag + login fix)
+js/useWingo-C_0L1WoG.js     -> (unchanged: reveal par fresh fetch)
+pwa-sw.js                   -> cache bust v2
+index.html, version.json    -> build v28 stamp
+=====================================================================

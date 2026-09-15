@@ -78,7 +78,7 @@ function ut(a) {
         loop: !0,
         volume: 1,
         preload: !1
-    }) : null, I = L(!1), C = L(!1), b = L(!1), _ = L(), d = new Map, q = n(() => t.issue), j = n(() => t.issueData || {}), A = n(() => ({
+    }) : null, I = L(!1), C = L(!1), b = L(!1), _ = L(), d = new Map, wlBusy = !1, q = n(() => t.issue), j = n(() => t.issueData || {}), A = n(() => ({
         interval: t.interval || 0,
         ...xe(t.countdown * 1e3)
     })), z = n(() => {
@@ -267,11 +267,31 @@ function ut(a) {
             }
         }
     }, Ae = async () => {
+        // ---- v28: win/loss popup fix -----------------------------------
+        // The popup never appeared because:
+        //  (1) After the period switch the NEW issue becomes history top,
+        //      so the issue the player bet on sits at index 1. The old
+        //      "> 0" check treated that as "too old", cleared the bet map
+        //      and returned BEFORE calling GetWinLossResult - popup dead.
+        //      On this engine index <= 1 means "the round that just ended".
+        //  (2) The reveal-sound callback and the auto-refresh timers both
+        //      call this function within ~2s of each other; the lock below
+        //      keeps it to one popup per result.
+        if (wlBusy) return;
+        const e = [...d.keys()];
+        if (!e.length) return;
+        // Oldest pending bet first: it is the round that just ended. (Taking
+        // the newest one pops the still-open round when the player bet on two
+        // consecutive rounds.)
+        const s = e[0];
+        // Drop only truly stale issues (2+ rounds old); keep newer pending
+        // bets in the map so their popup fires at their own round end.
+        if (E.value.findIndex(N => N.issueNumber === s) > 1) {
+            d.delete(s);
+            return
+        }
+        wlBusy = !0;
         try {
-            const e = [...d.keys()].reverse();
-            if (!e.length) return;
-            const s = e[0];
-            if (E.value.findIndex(N => N.issueNumber === s) > 0) return d.clear();
             const {
                 result: i,
                 data: r
@@ -292,8 +312,10 @@ function ut(a) {
                 amount: r.winAmount || 0,
                 issueNumber: s,
                 result: M
-            }), d.clear(), x && R()
-        } catch {}
+            }), d.delete(s), x && R()
+        } catch {} finally {
+            wlBusy = !1
+        }
     }, Se = e => {
         e.length !== 0 && (t.historyIssues = e || [])
     }, he = async () => {
