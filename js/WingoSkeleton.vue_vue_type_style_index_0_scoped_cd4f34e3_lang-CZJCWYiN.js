@@ -55,7 +55,7 @@ const S = new de,
             const r = "",
                 s = "",
                 c = "";
-            return e.url = `${e.baseURL||""}${e.url}`, (l = e.url) != null && l.includes("/kv/") || ((g = e.url) != null && g.includes(".json") ? e.url = e.url : (e.headers.Authorization = `Bearer ${h.get(m.TOKEN)}`, e.url = e.url), (i = e.url) != null && i.includes(".json")) || (e.method === "get" ? e.params = D(Object.assign(e.params || {}, {
+            return e.url = `${e.baseURL||""}${e.url}`, (l = e.url) != null && l.includes("/kv/") || ((g = e.url) != null && g.includes(".json") ? e.url = e.url : (e.headers.Authorization = `Bearer ${h.get(m.TOKEN) || localStorage.getItem("ar_token") || ""}`, e.url = e.url), (i = e.url) != null && i.includes(".json")) || (e.method === "get" ? e.params = D(Object.assign(e.params || {}, {
                 language: h.get(m.LANG) || K
             })) : D(Object.assign(e.data || {}, {
                 language: h.get(m.LANG) || K
@@ -214,7 +214,7 @@ const {
                 t.push(...d.gameList)
             }), t.find(d => d.gameCode === i.value) || {}
         }),
-        _ = a(() => n.token || p.get(m.TOKEN) || ""),
+        _ = a(() => n.token || p.get(m.TOKEN) || localStorage.getItem("ar_token") || ""),
         R = a(() => {
             var t;
             return (t = c.value) == null ? void 0 : t.sysCurrency
@@ -247,7 +247,7 @@ const {
         },
         $ = async () => {
             try {
-                if (!p.get(m.TOKEN) || c.value) return;
+                if (!(p.get(m.TOKEN) || localStorage.getItem("ar_token")) || c.value) return;
                 const t = await ye();
                 t.result && ee(t.data)
             } catch {}

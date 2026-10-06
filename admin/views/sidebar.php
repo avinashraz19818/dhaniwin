@@ -193,12 +193,6 @@ $adminManageTabs = ['bonus_manage', 'admin_password', 'check_same_ip', 'site_mai
         </div>
     </div>
 
-    <!-- SETTINGS & API ENGINE -->
-    <a class="sidebar-nav-link <?php echo $currentTab === 'settings' ? 'active' : ''; ?>" href="/admin/?tab=settings">
-        <i class="fas fa-sliders-h text-warning"></i>
-        <span>System & API Settings</span>
-    </a>
-
     <!-- GO TO WEBSITE -->
     <a class="sidebar-nav-link" href="/" target="_blank">
         <i class="fas fa-external-link-alt text-muted"></i>

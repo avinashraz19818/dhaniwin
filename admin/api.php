@@ -22,24 +22,26 @@ require_once __DIR__ . '/controllers/SettingsController.php';
 require_once __DIR__ . '/controllers/ReportController.php';
 
 // Helper function to verify CSRF
-function verify_csrf(): bool
-{
-    $token = '';
-    if (isset($_REQUEST['csrf'])) {
-        $token = (string)$_REQUEST['csrf'];
-    } elseif (isset($_SERVER['HTTP_X_CSRF_TOKEN'])) {
-        $token = (string)$_SERVER['HTTP_X_CSRF_TOKEN'];
-    } else {
-        $headers = function_exists('getallheaders') ? getallheaders() : [];
-        foreach ($headers as $key => $value) {
-            if (strcasecmp($key, 'X-CSRF-Token') === 0) {
-                $token = (string)$value;
-                break;
+if (!function_exists('verify_csrf')) {
+    function verify_csrf(): bool
+    {
+        $token = '';
+        if (isset($_REQUEST['csrf'])) {
+            $token = (string)$_REQUEST['csrf'];
+        } elseif (isset($_SERVER['HTTP_X_CSRF_TOKEN'])) {
+            $token = (string)$_SERVER['HTTP_X_CSRF_TOKEN'];
+        } else {
+            $headers = function_exists('getallheaders') ? getallheaders() : [];
+            foreach ($headers as $key => $value) {
+                if (strcasecmp($key, 'X-CSRF-Token') === 0) {
+                    $token = (string)$value;
+                    break;
+                }
             }
         }
+        $sessionToken = (string)($_SESSION['csrf'] ?? '');
+        return $sessionToken !== '' && hash_equals($sessionToken, $token);
     }
-    $sessionToken = (string)($_SESSION['csrf'] ?? '');
-    return $sessionToken !== '' && hash_equals($sessionToken, $token);
 }
 
 // 1. Check logged in status
@@ -65,6 +67,18 @@ if ($isWriteAction && !verify_csrf()) {
 }
 
 $adminId = (int)($_SESSION['admin_id'] ?? 0);
+
+// Plain HTML form posts (the settings/gateway tables submit without AJAX) get a
+// redirect back to the page they came from plus a flash message, instead of raw
+// JSON in the browser window.
+$isAjaxRequest = (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower((string)$_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest')
+    || str_contains((string)($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+    || !empty($_POST['ajax']);
+$bufferPlainPost = ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isAjaxRequest);
+
+if ($bufferPlainPost) {
+    ob_start();
+}
 
 try {
     switch ($action) {
@@ -297,11 +311,45 @@ try {
             if ($res['success']) {
                 AuthController::logActivity($adminId, 'save_setting', 'api_settings', $key, $val);
             }
-            if (empty($_SERVER['HTTP_X_REQUESTED_WITH']) && !str_contains($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json')) {
-                header('Location: ' . ($_SERVER['HTTP_REFERER'] ?? '/admin/?tab=settings'));
-                exit;
-            }
             echo json_encode($res);
+            break;
+
+        case 'change_own_password':
+            // Available to every logged in admin, also the read-only staff role.
+            $oldPassword = (string)($_POST['old_password'] ?? '');
+            $newPassword = (string)($_POST['new_password'] ?? '');
+            if (strlen($newPassword) < 6) {
+                echo json_encode(['success' => false, 'message' => 'New password must be at least 6 characters']);
+                break;
+            }
+            $res = AuthController::changePassword($adminId, $oldPassword, $newPassword);
+            echo json_encode($res);
+            break;
+
+        case 'save_admin_profile':
+            // Change the logged in admin's own username / email.
+            $newUsername = trim((string)($_POST['username'] ?? ''));
+            $newEmail = trim((string)($_POST['email'] ?? ''));
+            if ($newUsername === '') {
+                echo json_encode(['success' => false, 'message' => 'Username cannot be empty']);
+                break;
+            }
+            $pdo = api_pdo();
+            try {
+                $stmt = $pdo->prepare("SELECT id FROM admin_users WHERE username = ? AND id <> ? LIMIT 1");
+                $stmt->execute([$newUsername, $adminId]);
+                if ($stmt->fetch()) {
+                    echo json_encode(['success' => false, 'message' => 'That username is already taken']);
+                    break;
+                }
+                $stmt = $pdo->prepare("UPDATE admin_users SET username = ?, email = ? WHERE id = ?");
+                $stmt->execute([$newUsername, $newEmail !== '' ? $newEmail : null, $adminId]);
+                $_SESSION['admin_username'] = $newUsername;
+                AuthController::logActivity($adminId, 'save_admin_profile', 'admin_users', (string)$adminId, json_encode(['username' => $newUsername, 'email' => $newEmail]));
+                echo json_encode(['success' => true, 'message' => 'Profile updated successfully']);
+            } catch (Throwable $e) {
+                echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
+            }
             break;
 
         case 'save_payment':
@@ -553,6 +601,40 @@ try {
             }
             break;
 
+        case 'list_gift_redemptions':
+            if (!admin_has_permission('settings')) {
+                throw new Exception('Permission denied: settings');
+            }
+            $pdo = api_pdo();
+            try {
+                $stmt = $pdo->query("
+                    SELECT r.id, r.code, r.user_id, r.amount, r.balance_after, r.created_at,
+                           u.username, u.nickname, u.phone
+                    FROM gift_code_redemptions r
+                    LEFT JOIN api_users u ON u.id = r.user_id
+                    ORDER BY r.id DESC
+                    LIMIT 200
+                ");
+                $rows = $stmt->fetchAll() ?: [];
+            } catch (Throwable $e) {
+                $rows = [];
+            }
+            $data = [];
+            foreach ($rows as $row) {
+                $data[] = [
+                    'id' => (int)$row['id'],
+                    'code' => htmlspecialchars((string)$row['code']),
+                    'username' => htmlspecialchars((string)($row['username'] ?? ('User #' . (int)$row['user_id']))),
+                    'nickname' => htmlspecialchars((string)($row['nickname'] ?? '')),
+                    'phone' => htmlspecialchars((string)($row['phone'] ?? '')),
+                    'amount' => (float)$row['amount'],
+                    'balance_after' => (float)$row['balance_after'],
+                    'created_at' => (string)$row['created_at'],
+                ];
+            }
+            echo json_encode(['success' => true, 'data' => $data]);
+            break;
+
         case 'delete_gift_code':
             if (!admin_has_permission('settings')) {
                 throw new Exception('Permission denied: settings');
@@ -567,6 +649,160 @@ try {
             } catch (Throwable $e) {
                 echo json_encode(['success' => false, 'message' => $e->getMessage()]);
             }
+            break;
+
+        // --- Demo users ---------------------------------------------------
+        case 'list_demo_users':
+            if (!admin_has_permission('user_management')) {
+                throw new Exception('Permission denied: user_management');
+            }
+            echo json_encode(UserController::listDemoUsers($_GET));
+            break;
+
+        case 'create_demo_user':
+            if (!admin_has_permission('user_management')) {
+                throw new Exception('Permission denied: user_management');
+            }
+            $res = UserController::createDemoUser($_POST);
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, 'create_demo_user', 'api_users', null, json_encode(['username' => $_POST['username'] ?? '', 'balance' => $_POST['balance'] ?? '']));
+            }
+            echo json_encode($res);
+            break;
+
+        case 'delete_demo_user':
+            if (!admin_has_permission('user_management')) {
+                throw new Exception('Permission denied: user_management');
+            }
+            $res = UserController::deleteDemoUser((int)($_POST['id'] ?? 0));
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, 'delete_demo_user', 'api_users', (string)($_POST['id'] ?? ''), null);
+            }
+            echo json_encode($res);
+            break;
+
+        case 'reset_demo_balance':
+            if (!admin_has_permission('user_management')) {
+                throw new Exception('Permission denied: user_management');
+            }
+            $res = UserController::resetDemoBalance((int)($_POST['id'] ?? 0), (float)($_POST['balance'] ?? 0));
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, 'reset_demo_balance', 'api_users', (string)($_POST['id'] ?? ''), 'Balance: ' . ($_POST['balance'] ?? ''));
+            }
+            echo json_encode($res);
+            break;
+
+        // --- Agent / promoter users ---------------------------------------
+        case 'list_agents':
+            if (!admin_has_permission('agent_management')) {
+                throw new Exception('Permission denied: agent_management');
+            }
+            echo json_encode(UserController::listAgents($_GET));
+            break;
+
+        case 'create_agent_user':
+            if (!admin_has_permission('agent_management')) {
+                throw new Exception('Permission denied: agent_management');
+            }
+            $res = UserController::createAgentUser($_POST);
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, 'create_agent_user', 'api_users', null, json_encode(['username' => $_POST['username'] ?? '', 'rate' => $_POST['agent_rate'] ?? '']));
+            }
+            echo json_encode($res);
+            break;
+
+        // --- Banned / blocked users ---------------------------------------
+        case 'list_banned_users':
+            if (!admin_has_permission('user_management')) {
+                throw new Exception('Permission denied: user_management');
+            }
+            echo json_encode(UserController::listBannedUsers($_GET));
+            break;
+
+        case 'set_user_ban':
+            if (!admin_has_permission('user_management')) {
+                throw new Exception('Permission denied: user_management');
+            }
+            $banFlag = (int)($_POST['ban'] ?? 1) === 1;
+            $res = UserController::setUserBan((int)($_POST['id'] ?? 0), $banFlag, (string)($_POST['reason'] ?? ''));
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, $banFlag ? 'ban_user' : 'unban_user', 'api_users', (string)($_POST['id'] ?? ''), (string)($_POST['reason'] ?? ''));
+            }
+            echo json_encode($res);
+            break;
+
+        case 'delete_user':
+            if (!admin_has_permission('user_management')) {
+                throw new Exception('Permission denied: user_management');
+            }
+            $res = UserController::deleteUser((int)($_POST['id'] ?? 0));
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, 'delete_user', 'api_users', (string)($_POST['id'] ?? ''), null);
+            }
+            echo json_encode($res);
+            break;
+
+        case 'list_user_options':
+            if (!admin_has_permission('user_management') && !admin_has_permission('support')) {
+                throw new Exception('Permission denied: user_management');
+            }
+            echo json_encode(['success' => true, 'data' => UserController::listUserOptions()]);
+            break;
+
+        // --- Gateway / UPI / USDT helper actions --------------------------
+        case 'list_payments':
+            if (!admin_has_permission('settings')) {
+                throw new Exception('Permission denied: settings');
+            }
+            echo json_encode(['success' => true, 'data' => SettingsController::getPaymentMethods()]);
+            break;
+
+        case 'list_usdt_methods':
+            if (!admin_has_permission('settings')) {
+                throw new Exception('Permission denied: settings');
+            }
+            echo json_encode(['success' => true, 'data' => SettingsController::getUsdtMethods()]);
+            break;
+
+        case 'save_payment_image':
+            if (!admin_has_permission('settings')) {
+                throw new Exception('Permission denied: settings');
+            }
+            $res = SettingsController::saveGatewayImage('payment_methods', (int)($_POST['id'] ?? 0), $_POST, $_FILES);
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, 'save_payment_image', 'payment_methods', (string)($_POST['id'] ?? ''), json_encode($res));
+            }
+            echo json_encode($res);
+            break;
+
+        case 'save_usdt_image':
+            if (!admin_has_permission('settings')) {
+                throw new Exception('Permission denied: settings');
+            }
+            $res = SettingsController::saveGatewayImage('usdt_methods', (int)($_POST['id'] ?? 0), $_POST, $_FILES);
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, 'save_usdt_image', 'usdt_methods', (string)($_POST['id'] ?? ''), json_encode($res));
+            }
+            echo json_encode($res);
+            break;
+
+        // --- Support tickets per category ---------------------------------
+        case 'support_category_counts':
+            if (!admin_has_permission('support')) {
+                throw new Exception('Permission denied: support');
+            }
+            echo json_encode(['success' => true, 'data' => SupportController::categoryCounts()]);
+            break;
+
+        case 'create_ticket':
+            if (!admin_has_permission('support')) {
+                throw new Exception('Permission denied: support');
+            }
+            $res = SupportController::createTicket($_POST);
+            if (!empty($res['success'])) {
+                AuthController::logActivity($adminId, 'create_ticket', 'support_tickets', (string)($res['ticket_id'] ?? ''), (string)($_POST['category'] ?? ''));
+            }
+            echo json_encode($res);
             break;
 
         case 'check_same_ip':
@@ -629,4 +865,46 @@ try {
 } catch (Throwable $e) {
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+}
+
+// Plain HTML form post: send the browser back to the page it came from with a
+// flash message instead of printing JSON.
+if ($bufferPlainPost) {
+    $rawOutput = (string) ob_get_clean();
+    $decoded = json_decode($rawOutput, true);
+    $ok = is_array($decoded) && !empty($decoded['success']);
+    $message = is_array($decoded) ? (string)($decoded['message'] ?? '') : 'Request failed';
+    if ($message === '') {
+        $message = $ok ? 'Saved successfully' : 'Request failed';
+    }
+
+    $back = (string)($_SERVER['HTTP_REFERER'] ?? '');
+    // Only redirect back to this same host. A referer pointing somewhere else
+    // (or a referer with a host the browser cannot reach) used to send the
+    // panel to a dead page after "Create Demo User".
+    $backOk = $back !== '' && strpos($back, '/admin/') !== false;
+    if ($backOk) {
+        $refHost = (string) parse_url($back, PHP_URL_HOST);
+        $ownHost = (string) ($_SERVER['HTTP_HOST'] ?? '');
+        if ($refHost !== '' && $ownHost !== '' && strcasecmp($refHost, $ownHost) !== 0) {
+            $backOk = false;
+        }
+    }
+    if (!$backOk) {
+        $back = '/admin/?tab=' . rawurlencode((string)($_REQUEST['return_tab'] ?? 'dashboard'));
+    }
+
+    $separator = strpos($back, '?') === false ? '?' : '&';
+    $target = $back . $separator . 'flash=' . rawurlencode($message) . '&flash_type=' . ($ok ? 'ok' : 'err');
+
+    if (PHP_SAPI === 'cli' || headers_sent()) {
+        // CLI/wasm test harnesses cannot read headers, and a host that already
+        // flushed output cannot redirect: answer with JSON so the panel shows
+        // the result instead of a dead page.
+        echo json_encode(['success' => $ok, 'redirect' => $target, 'message' => $message]);
+    } else {
+        header('Location: ' . $target);
+    }
+    exit;
+
 }

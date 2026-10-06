@@ -239,6 +239,24 @@ $hasAccess = admin_has_permission($requiredPermissions[$tab]);
 
         <!-- DYNAMIC PANEL ROUTING -->
 
+        <?php
+          $flashMessage = trim((string)($_GET['flash'] ?? ''));
+          $flashType = (string)($_GET['flash_type'] ?? 'ok');
+        ?>
+        <?php if ($flashMessage !== ''): ?>
+          <div class="alert <?php echo $flashType === 'err' ? 'alert-danger' : 'alert-success'; ?> border-0 d-flex align-items-center gap-2 mb-4" role="alert" style="border-radius: 14px;">
+            <i class="fas <?php echo $flashType === 'err' ? 'fa-exclamation-circle' : 'fa-check-circle'; ?>"></i>
+            <span class="fw-bold"><?php echo htmlspecialchars($flashMessage); ?></span>
+          </div>
+          <script>
+          setTimeout(function () {
+              if (typeof window.showToast === 'function') {
+                  window.showToast(<?php echo json_encode($flashMessage); ?>, <?php echo $flashType === 'err' ? "'danger'" : "'success'"; ?>);
+              }
+          }, 600);
+          </script>
+        <?php endif; ?>
+
         <?php if ($tab === 'dashboard'): ?>
           <div id="dashboard-view">
             <h2 class="fw-bold mb-4"><i class="fas fa-chart-line text-gold me-2"></i> Operational Performance</h2>
@@ -845,27 +863,7 @@ $hasAccess = admin_has_permission($requiredPermissions[$tab]);
                 </div>
             </div>
 
-            <!-- Modal: Ticket Chat dialogue -->
-            <div class="modal fade" id="modal-chat" tabindex="-1">
-              <div class="modal-dialog modal-dialog-centered modal-lg">
-                <div class="modal-content modal-content-premium text-white">
-                  <div class="modal-header modal-header-premium">
-                    <h5 class="modal-title fw-bold" id="chat-title">Ticket Chat</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-                  </div>
-                  <div class="modal-body p-4">
-                    <div id="chat-box-body" style="height: 350px; overflow-y: auto; background: rgba(7,9,19,0.3); padding: 15px; border-radius: 12px; border: 1px solid var(--border-light);">
-                        <!-- Chat logs load dynamically -->
-                    </div>
-                    <input type="hidden" id="chat-ticket-id">
-                    <div class="input-group mt-3">
-                        <input id="chat-input-message" class="form-control form-control-premium" placeholder="Type administrator reply here...">
-                        <button type="button" id="btn-send-reply" class="btn btn-premium">Send Reply</button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
+            <?php require __DIR__ . '/views/support-chat-modal.php'; ?>
           </div>
         <?php endif; ?>
 
@@ -1352,6 +1350,28 @@ $hasAccess = admin_has_permission($requiredPermissions[$tab]);
                         </tbody>
                     </table>
                 </div>
+                <div class="text-muted small mt-3">
+                    <i class="fas fa-info-circle me-1"></i> Members redeem these codes on the site's <strong>Gift / Reward Redemption Code</strong> page. Every successful claim is credited instantly and appears below.
+                </div>
+            </div>
+
+            <div class="glass-panel p-4 mt-4">
+                <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-history me-2"></i> Redemption Log</h4>
+                <div class="table-responsive table-responsive-premium">
+                    <table class="table align-middle" id="gift-redemptions-table">
+                        <thead>
+                            <tr>
+                                <th>Code</th>
+                                <th>Member</th>
+                                <th>Amount</th>
+                                <th>Redeemed At</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td colspan="4" class="text-center text-muted">Loading redemptions...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 
             <!-- Modal: Add Gift Code -->
@@ -1752,31 +1772,968 @@ $hasAccess = admin_has_permission($requiredPermissions[$tab]);
           </div>
         <?php endif; ?>
 
-        <!-- Redirect Placeholders for remaining tabs -->
-        <?php if (in_array($tab, ['add_upi', 'usdt_rate', 'add_usdt', 'add_upi_image', 'add_usdt_image', 'upi_withdraw', 'withdraw_sent', 'withdraw_reject'], true)): ?>
-          <div class="glass-panel p-5 text-center mt-5">
-              <div class="display-4 text-gold mb-3"><i class="fas fa-credit-card"></i></div>
-              <h3 class="fw-bold">Gateway & Payout Management</h3>
-              <p class="text-secondary mb-4">Please manage payment gateways, rates, and active methods from the main Gateway Rotations manager.</p>
-              <a href="/admin/?tab=gateways" class="btn btn-premium">Go to Gateways</a>
+        <!-- ============================================================= -->
+        <!-- DEMO USER MANAGER                                            -->
+        <!-- ============================================================= -->
+        <?php if ($tab === 'demo_user'): ?>
+          <div id="demo-user-view">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
+              <div>
+                <h2 class="fw-bold mb-1"><i class="fas fa-user-astronaut text-gold me-2"></i> Demo User Manager</h2>
+                <p class="text-secondary mb-0">Create test / demo accounts with a demo balance in one click. Demo users can login on the site with the username and password entered below.</p>
+              </div>
+              <a href="/admin/?tab=users" class="btn btn-secondary-premium"><i class="fas fa-users me-1"></i> All Members</a>
+            </div>
+
+            <div class="row g-4">
+              <div class="col-xl-5">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-user-plus me-2"></i> Create Demo User</h4>
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="create_demo_user">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="demo_user">
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Username / Phone *</label>
+                      <input name="username" class="form-control form-control-premium" placeholder="e.g. demo001" required>
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Password</label>
+                      <input name="password" class="form-control form-control-premium" placeholder="demo123 (default)">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Nickname</label>
+                      <input name="nickname" class="form-control form-control-premium" placeholder="Demo Account">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Phone</label>
+                      <input name="phone" class="form-control form-control-premium" placeholder="Optional">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Demo Balance (₹)</label>
+                      <input type="number" step="0.01" min="0" name="balance" class="form-control form-control-premium" value="10000">
+                    </div>
+                    <div class="col-md-6 d-flex align-items-end">
+                      <button type="submit" class="btn btn-premium w-100 justify-content-center"><i class="fas fa-bolt me-1"></i> Create Demo User</button>
+                    </div>
+                    <div class="col-12">
+                      <div class="text-muted small"><i class="fas fa-info-circle me-1"></i> The demo balance is credited to the wallet and game balance together, so the site shows it everywhere.</div>
+                    </div>
+                  </form>
+                </div>
+              </div>
+
+              <div class="col-xl-7">
+                <div class="glass-panel p-4 h-100">
+                  <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h4 class="fw-bold m-0 text-gold"><i class="fas fa-list me-2"></i> Existing Demo Users</h4>
+                    <button type="button" class="btn btn-sm btn-secondary-premium" id="btn-refresh-demo-users"><i class="fas fa-sync"></i></button>
+                  </div>
+                  <div class="table-responsive table-responsive-premium">
+                    <table class="table align-middle" id="demo-users-table">
+                      <thead>
+                        <tr>
+                          <th>Username</th>
+                          <th>Nickname</th>
+                          <th>Phone</th>
+                          <th>Balance</th>
+                          <th>Status</th>
+                          <th class="text-end">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr><td colspan="6" class="text-center text-muted">Loading demo users...</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         <?php endif; ?>
 
-        <?php if (in_array($tab, ['support_deposit', 'support_withdraw', 'support_ifsc', 'support_bank', 'support_game'], true)): ?>
-          <div class="glass-panel p-5 text-center mt-5">
-              <div class="display-4 text-gold mb-3"><i class="fas fa-headset"></i></div>
-              <h3 class="fw-bold">Support Tickets Categorization</h3>
-              <p class="text-secondary mb-4">Please manage support tickets and replies from the main Support Tickets panel.</p>
-              <a href="/admin/?tab=support" class="btn btn-premium">Go to Tickets</a>
+        <!-- ============================================================= -->
+        <!-- AGENT USER MANAGER                                           -->
+        <!-- ============================================================= -->
+        <?php if ($tab === 'agent_user'): ?>
+          <div id="agent-user-view">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
+              <div>
+                <h2 class="fw-bold mb-1"><i class="fas fa-user-tie text-gold me-2"></i> Agent / Promoter Users</h2>
+                <p class="text-secondary mb-0">Create promoter accounts and set their commission rate. Agents earn commission when their invited players bet.</p>
+              </div>
+              <a href="/admin/?tab=agents" class="btn btn-secondary-premium"><i class="fas fa-sitemap me-1"></i> Agent Trees &amp; Commissions</a>
+            </div>
+
+            <div class="row g-4">
+              <div class="col-xl-5">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-user-plus me-2"></i> Create Agent User</h4>
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="create_agent_user">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="agent_user">
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Username / Phone *</label>
+                      <input name="username" class="form-control form-control-premium" placeholder="e.g. agent_rahul" required>
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Password</label>
+                      <input name="password" class="form-control form-control-premium" placeholder="agent123 (default)">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Nickname</label>
+                      <input name="nickname" class="form-control form-control-premium" placeholder="Agent Account">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Phone</label>
+                      <input name="phone" class="form-control form-control-premium" placeholder="Optional">
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Commission Rate (%)</label>
+                      <input type="number" step="0.01" min="0" max="100" name="agent_rate" class="form-control form-control-premium" value="0">
+                    </div>
+                    <div class="col-md-6 d-flex align-items-end">
+                      <button type="submit" class="btn btn-premium w-100 justify-content-center"><i class="fas fa-plus me-1"></i> Create Agent</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+
+              <div class="col-xl-7">
+                <div class="glass-panel p-4 h-100">
+                  <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h4 class="fw-bold m-0 text-gold"><i class="fas fa-list me-2"></i> Agent Accounts</h4>
+                    <button type="button" class="btn btn-sm btn-secondary-premium" id="btn-refresh-agents"><i class="fas fa-sync"></i></button>
+                  </div>
+                  <div class="table-responsive table-responsive-premium">
+                    <table class="table align-middle" id="agents-table">
+                      <thead>
+                        <tr>
+                          <th>Username</th>
+                          <th>Phone</th>
+                          <th>Rate</th>
+                          <th>Team</th>
+                          <th>Commission</th>
+                          <th class="text-end">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr><td colspan="6" class="text-center text-muted">Loading agents...</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         <?php endif; ?>
 
-        <?php if (in_array($tab, ['bonus_manage', 'admin_password', 'banned_users', 'demo_user', 'agent_user'], true)): ?>
-          <div class="glass-panel p-5 text-center mt-5">
-              <div class="display-4 text-gold mb-3"><i class="fas fa-sliders-h"></i></div>
-              <h3 class="fw-bold">Configuration Parameters</h3>
-              <p class="text-secondary mb-4">This administrative action is managed inside the site Settings & Configurations panel.</p>
-              <a href="/admin/?tab=settings" class="btn btn-premium">Go to Settings</a>
+        <!-- ============================================================= -->
+        <!-- BONUS MANAGE                                                 -->
+        <!-- ============================================================= -->
+        <?php if ($tab === 'bonus_manage'): ?>
+          <div id="bonus-manage-view">
+            <h2 class="fw-bold mb-4"><i class="fas fa-gift text-gold me-2"></i> Bonus Manage</h2>
+
+            <div class="row g-4">
+              <div class="col-lg-6">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-arrow-alt-circle-down me-2"></i> First Deposit Bonus</h4>
+                  <p class="text-secondary small">This bonus is added automatically when the first deposit of a member is approved from the Deposit Update page.</p>
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="save_setting">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="bonus_manage">
+                    <input type="hidden" name="setting_key" value="first_recharge_bonus_enabled">
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">Bonus Status</label>
+                      <?php $bonusOn = api_setting('first_recharge_bonus_enabled', '1'); ?>
+                      <select name="setting_value" class="form-control form-control-premium">
+                        <option value="1" <?php echo $bonusOn === '1' ? 'selected' : ''; ?>>Enabled</option>
+                        <option value="0" <?php echo $bonusOn !== '1' ? 'selected' : ''; ?>>Disabled</option>
+                      </select>
+                    </div>
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-premium btn-sm">Save Bonus Status</button>
+                    </div>
+                  </form>
+
+                  <hr class="border-secondary">
+
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="save_setting">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="bonus_manage">
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Bonus Percent (%)</label>
+                      <input type="number" step="0.01" min="0" name="setting_value" class="form-control form-control-premium" value="<?php echo htmlspecialchars(api_setting('first_recharge_bonus_percent', '10')); ?>">
+                      <input type="hidden" name="setting_key" value="first_recharge_bonus_percent">
+                    </div>
+                    <div class="col-md-6 d-flex align-items-end">
+                      <button type="submit" class="btn btn-premium btn-sm w-100">Save Percent</button>
+                    </div>
+                  </form>
+
+                  <form action="api.php" method="post" class="row g-3 mt-1">
+                    <input type="hidden" name="action" value="save_setting">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="bonus_manage">
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Maximum Bonus (₹)</label>
+                      <input type="number" step="0.01" min="0" name="setting_value" class="form-control form-control-premium" value="<?php echo htmlspecialchars(api_setting('first_recharge_bonus_max', '500')); ?>">
+                      <input type="hidden" name="setting_key" value="first_recharge_bonus_max">
+                    </div>
+                    <div class="col-md-6 d-flex align-items-end">
+                      <button type="submit" class="btn btn-premium btn-sm w-100">Save Maximum</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+
+              <div class="col-lg-6">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-sitemap me-2"></i> Agent / Invite Commission</h4>
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="save_setting">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="bonus_manage">
+                    <input type="hidden" name="setting_key" value="agent_rebate_enabled">
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">Agent Commission Status</label>
+                      <?php $agentOn = api_setting('agent_rebate_enabled', '1'); ?>
+                      <select name="setting_value" class="form-control form-control-premium">
+                        <option value="1" <?php echo $agentOn === '1' ? 'selected' : ''; ?>>Enabled</option>
+                        <option value="0" <?php echo $agentOn !== '1' ? 'selected' : ''; ?>>Disabled</option>
+                      </select>
+                    </div>
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-premium btn-sm">Save Agent Status</button>
+                    </div>
+                  </form>
+
+                  <hr class="border-secondary">
+
+                  <h5 class="fw-bold text-white mb-2">First Deposit Bonus Preview</h5>
+                  <?php $bonusPercentPreview = (float) api_setting('first_recharge_bonus_percent', '10'); $bonusMaxPreview = (float) api_setting('first_recharge_bonus_max', '500'); ?>
+                  <p class="text-secondary small mb-2">See what a member receives on their first deposit:</p>
+                  <div id="bonus-preview-box" data-bonus-percent="<?php echo (float)$bonusPercentPreview; ?>" data-bonus-max="<?php echo (float)$bonusMaxPreview; ?>">
+                  <div class="input-group mb-2">
+                    <span class="input-group-text border-0" style="background: rgba(7,9,19,0.6);">₹</span>
+                    <input type="number" id="bonus-preview-amount" class="form-control form-control-premium" value="500">
+                  </div>
+                  <div class="p-3 rounded" style="background: rgba(7,9,19,0.4); border: 1px solid var(--border-light);">
+                    <div class="d-flex justify-content-between"><span class="text-secondary small">Deposit</span><span class="fw-bold text-white" id="bonus-preview-base">₹500.00</span></div>
+                    <div class="d-flex justify-content-between"><span class="text-secondary small">Bonus</span><span class="fw-bold text-success" id="bonus-preview-bonus">₹50.00</span></div>
+                    <div class="d-flex justify-content-between border-top border-secondary mt-2 pt-2"><span class="text-secondary small">Total Credit</span><span class="fw-bold text-gold" id="bonus-preview-total">₹550.00</span></div>
+                  </div>
+                  </div>
+                  <div class="text-muted small mt-2">Current rule:
+                    <strong class="text-white"><?php echo (int) api_setting('first_recharge_bonus_percent', '10'); ?>%</strong> of the deposit, capped at
+                    <strong class="text-white">₹<?php echo number_format((float) api_setting('first_recharge_bonus_max', '500'), 2); ?></strong>.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <!-- ============================================================= -->
+        <!-- ADMIN PASSWORD / OWN PROFILE                                 -->
+        <!-- ============================================================= -->
+        <?php if ($tab === 'admin_password'): ?>
+          <div id="admin-password-view">
+            <h2 class="fw-bold mb-4"><i class="fas fa-key text-gold me-2"></i> Admin Password &amp; Profile</h2>
+
+            <div class="row g-4">
+              <div class="col-lg-5">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-user-circle me-2"></i> My Login Details</h4>
+                  <?php $me = admin_db_rows("SELECT u.username, u.email, u.created_at, r.role_label FROM admin_users u LEFT JOIN admin_roles r ON r.id = u.role_id WHERE u.id = ? LIMIT 1", [(int)($_SESSION['admin_id'] ?? 0)]); $me = $me[0] ?? []; ?>
+                  <div class="mb-3">
+                    <span class="text-secondary small d-block">Username</span>
+                    <strong class="text-white"><?php echo htmlspecialchars((string)($me['username'] ?? ($_SESSION['admin_username'] ?? 'admin'))); ?></strong>
+                  </div>
+                  <div class="mb-3">
+                    <span class="text-secondary small d-block">Role</span>
+                    <strong class="text-white"><?php echo htmlspecialchars((string)($me['role_label'] ?? 'Super Admin')); ?></strong>
+                  </div>
+                  <div class="mb-0">
+                    <span class="text-secondary small d-block">Account created</span>
+                    <strong class="text-white"><?php echo htmlspecialchars(substr((string)($me['created_at'] ?? ''), 0, 16)); ?></strong>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-lg-7">
+                <div class="glass-panel p-4 mb-4">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-lock me-2"></i> Change My Password</h4>
+                  <form action="api.php" method="post" class="row g-3" id="form-own-password">
+                    <input type="hidden" name="action" value="change_own_password">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="admin_password">
+                    <div class="col-md-4">
+                      <label class="form-label text-secondary small fw-bold">Current Password *</label>
+                      <input type="password" name="old_password" id="own-old-password" class="form-control form-control-premium" required autocomplete="current-password">
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label text-secondary small fw-bold">New Password *</label>
+                      <input type="password" name="new_password" id="own-new-password" class="form-control form-control-premium" required minlength="6" autocomplete="new-password">
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label text-secondary small fw-bold">Confirm New Password *</label>
+                      <input type="password" id="own-confirm-password" class="form-control form-control-premium" required minlength="6" autocomplete="new-password">
+                    </div>
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-premium"><i class="fas fa-save me-1"></i> Update Password</button>
+                      <span class="text-muted small ms-2">Minimum 6 characters.</span>
+                    </div>
+                  </form>
+                </div>
+
+                <div class="glass-panel p-4">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-id-card me-2"></i> Change Username / Email</h4>
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="save_admin_profile">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="admin_password">
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Admin Username *</label>
+                      <input name="username" class="form-control form-control-premium" value="<?php echo htmlspecialchars((string)($me['username'] ?? ($_SESSION['admin_username'] ?? 'admin'))); ?>" required>
+                    </div>
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Email / Note</label>
+                      <input name="email" class="form-control form-control-premium" value="<?php echo htmlspecialchars((string)($me['email'] ?? '')); ?>" placeholder="Optional">
+                    </div>
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-premium"><i class="fas fa-save me-1"></i> Save Profile</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <!-- ============================================================= -->
+        <!-- BANNED USERS                                                 -->
+        <!-- ============================================================= -->
+        <?php if ($tab === 'banned_users'): ?>
+          <div id="banned-users-view">
+            <h2 class="fw-bold mb-4"><i class="fas fa-user-slash text-gold me-2"></i> Banned Users</h2>
+
+            <div class="row g-4">
+              <div class="col-xl-4">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-ban me-2"></i> Block a User</h4>
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="save_user">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="banned_users">
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">Select User</label>
+                      <select name="id" class="form-control form-control-premium" required>
+                        <option value="">-- choose member --</option>
+                        <?php foreach (admin_db_rows("SELECT id, user_id, username, nickname FROM api_users WHERE can_bet = 1 AND status = 1 ORDER BY id DESC LIMIT 500") as $opt): ?>
+                          <option value="<?php echo (int)$opt['id']; ?>"><?php echo htmlspecialchars($opt['username'] . ' (' . $opt['user_id'] . ')'); ?></option>
+                        <?php endforeach; ?>
+                      </select>
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">Reason</label>
+                      <input name="ban_reason" class="form-control form-control-premium" placeholder="e.g. multiple accounts / fraud">
+                    </div>
+                    <input type="hidden" name="can_bet" value="0">
+                    <input type="hidden" name="status" value="0">
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-danger w-100 fw-bold"><i class="fas fa-user-slash me-1"></i> Ban User</button>
+                      <div class="text-muted small mt-2">Banning stops new bets and disables the login of that member.</div>
+                    </div>
+                  </form>
+                </div>
+              </div>
+
+              <div class="col-xl-8">
+                <div class="glass-panel p-4 h-100">
+                  <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h4 class="fw-bold m-0 text-gold"><i class="fas fa-list me-2"></i> Blocked Members</h4>
+                    <button type="button" class="btn btn-sm btn-secondary-premium" id="btn-refresh-banned"><i class="fas fa-sync"></i></button>
+                  </div>
+                  <div class="table-responsive table-responsive-premium">
+                    <table class="table align-middle" id="banned-users-table">
+                      <thead>
+                        <tr>
+                          <th>Username</th>
+                          <th>Player ID</th>
+                          <th>Phone</th>
+                          <th>Balance</th>
+                          <th>Reason</th>
+                          <th class="text-end">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr><td colspan="6" class="text-center text-muted">Loading banned users...</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <!-- ============================================================= -->
+        <!-- ADD UPI                                                      -->
+        <!-- ============================================================= -->
+        <?php if ($tab === 'add_upi'):
+          $upiRows = SettingsController::getPaymentMethods();
+        ?>
+          <div id="add-upi-view">
+            <h2 class="fw-bold mb-2"><i class="fas fa-mobile-alt text-gold me-2"></i> Add UPI Account</h2>
+            <p class="text-secondary">UPI accounts listed here are the ones members see on the site's deposit page.</p>
+
+            <div class="glass-panel p-4 mb-4">
+              <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-plus me-2"></i> New UPI Account</h4>
+              <form action="api.php" method="post" class="row g-3">
+                <input type="hidden" name="action" value="save_payment">
+                <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                <input type="hidden" name="return_tab" value="add_upi">
+                <input type="hidden" name="method_type" value="UPI">
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Display Name *</label>
+                  <input name="method_name" class="form-control form-control-premium" placeholder="PhonePe" required>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Account Holder</label>
+                  <input name="account_name" class="form-control form-control-premium" placeholder="Dhani Win">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">UPI ID (VPA) *</label>
+                  <input name="account_value" class="form-control form-control-premium" placeholder="merchant@upi" required>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Sort Order</label>
+                  <input type="number" name="sort_order" class="form-control form-control-premium" value="10">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Min Amount (₹)</label>
+                  <input type="number" step="0.01" name="min_amount" class="form-control form-control-premium" value="100">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Max Amount (₹)</label>
+                  <input type="number" step="0.01" name="max_amount" class="form-control form-control-premium" value="50000">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Status</label>
+                  <select name="enabled" class="form-control form-control-premium">
+                    <option value="1">Active</option>
+                    <option value="0">Paused</option>
+                  </select>
+                </div>
+                <div class="col-md-3 d-flex align-items-end">
+                  <button type="submit" class="btn btn-premium w-100 justify-content-center"><i class="fas fa-plus me-1"></i> Add UPI</button>
+                </div>
+              </form>
+            </div>
+
+            <div class="glass-panel p-4">
+              <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-list me-2"></i> Existing UPI Accounts</h4>
+              <div class="table-responsive table-responsive-premium">
+                <table class="table align-middle">
+                  <thead>
+                    <tr>
+                      <th>Display Name</th>
+                      <th>Account Holder</th>
+                      <th>UPI ID</th>
+                      <th>Limits</th>
+                      <th>Sort</th>
+                      <th>Status</th>
+                      <th class="text-end">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php if (empty($upiRows)): ?>
+                      <tr><td colspan="7" class="text-center text-muted">No UPI account added yet.</td></tr>
+                    <?php endif; ?>
+                    <?php foreach ($upiRows as $upi): ?>
+                      <tr>
+                        <form action="api.php" method="post">
+                          <input type="hidden" name="action" value="save_payment">
+                          <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                          <input type="hidden" name="return_tab" value="add_upi">
+                          <input type="hidden" name="id" value="<?php echo (int)$upi['id']; ?>">
+                          <input type="hidden" name="method_type" value="UPI">
+                          <td><input name="method_name" class="form-control form-control-premium py-1" value="<?php echo htmlspecialchars((string)$upi['method_name']); ?>"></td>
+                          <td><input name="account_name" class="form-control form-control-premium py-1" value="<?php echo htmlspecialchars((string)($upi['account_name'] ?? '')); ?>"></td>
+                          <td><input name="account_value" class="form-control form-control-premium py-1" value="<?php echo htmlspecialchars((string)$upi['account_value']); ?>"></td>
+                          <td>
+                            <input type="number" step="0.01" name="min_amount" class="form-control form-control-premium py-1 d-inline-block" style="width: 90px;" value="<?php echo (float)$upi['min_amount']; ?>"> -
+                            <input type="number" step="0.01" name="max_amount" class="form-control form-control-premium py-1 d-inline-block" style="width: 100px;" value="<?php echo (float)$upi['max_amount']; ?>">
+                          </td>
+                          <td><input type="number" name="sort_order" class="form-control form-control-premium py-1" style="width: 70px;" value="<?php echo (int)$upi['sort_order']; ?>"></td>
+                          <td>
+                            <select name="enabled" class="form-control form-control-premium py-1">
+                              <option value="1" <?php echo !empty($upi['enabled']) ? 'selected' : ''; ?>>Active</option>
+                              <option value="0" <?php echo empty($upi['enabled']) ? 'selected' : ''; ?>>Paused</option>
+                            </select>
+                          </td>
+                          <td class="text-end">
+                            <button type="submit" class="btn btn-sm btn-premium py-1">Save</button>
+                            <button type="submit" formaction="api.php" name="action" value="delete_payment" class="btn btn-sm btn-outline-danger py-1" onclick="return confirm('Delete this UPI account?');">Delete</button>
+                          </td>
+                        </form>
+                      </tr>
+                    <?php endforeach; ?>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <!-- ============================================================= -->
+        <!-- ADD USDT                                                     -->
+        <!-- ============================================================= -->
+        <?php if ($tab === 'add_usdt'):
+          $usdtRows = SettingsController::getUsdtMethods();
+        ?>
+          <div id="add-usdt-view">
+            <h2 class="fw-bold mb-2"><i class="fas fa-coins text-gold me-2"></i> Add USDT Address</h2>
+            <p class="text-secondary">USDT wallets added here appear as crypto deposit options for members.</p>
+
+            <div class="glass-panel p-4 mb-4">
+              <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-plus me-2"></i> New USDT Wallet</h4>
+              <form action="api.php" method="post" class="row g-3">
+                <input type="hidden" name="action" value="save_usdt">
+                <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                <input type="hidden" name="return_tab" value="add_usdt">
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Wallet Name *</label>
+                  <input name="wallet_name" class="form-control form-control-premium" placeholder="Binance USDT" required>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label text-secondary small fw-bold">Wallet Address *</label>
+                  <input name="wallet_address" class="form-control form-control-premium" placeholder="T..." required>
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label text-secondary small fw-bold">Network</label>
+                  <input name="network" class="form-control form-control-premium" value="TRC20">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Sort Order</label>
+                  <input type="number" name="sort_order" class="form-control form-control-premium" value="5">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Min USDT</label>
+                  <input type="number" step="0.01" name="min_amount" class="form-control form-control-premium" value="10">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Max USDT</label>
+                  <input type="number" step="0.01" name="max_amount" class="form-control form-control-premium" value="10000">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label text-secondary small fw-bold">Status</label>
+                  <select name="enabled" class="form-control form-control-premium">
+                    <option value="1">Active</option>
+                    <option value="0">Paused</option>
+                  </select>
+                </div>
+                <div class="col-md-3 d-flex align-items-end">
+                  <button type="submit" class="btn btn-premium w-100 justify-content-center"><i class="fas fa-plus me-1"></i> Add Address</button>
+                </div>
+              </form>
+            </div>
+
+            <div class="glass-panel p-4">
+              <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-list me-2"></i> Existing USDT Wallets</h4>
+              <div class="table-responsive table-responsive-premium">
+                <table class="table align-middle">
+                  <thead>
+                    <tr>
+                      <th>Wallet Name</th>
+                      <th>Address</th>
+                      <th>Network</th>
+                      <th>Limits (USDT)</th>
+                      <th>Sort</th>
+                      <th>Status</th>
+                      <th class="text-end">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php if (empty($usdtRows)): ?>
+                      <tr><td colspan="7" class="text-center text-muted">No USDT wallet added yet.</td></tr>
+                    <?php endif; ?>
+                    <?php foreach ($usdtRows as $usdt): ?>
+                      <tr>
+                        <form action="api.php" method="post">
+                          <input type="hidden" name="action" value="save_usdt">
+                          <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                          <input type="hidden" name="return_tab" value="add_usdt">
+                          <input type="hidden" name="id" value="<?php echo (int)$usdt['id']; ?>">
+                          <td><input name="wallet_name" class="form-control form-control-premium py-1" value="<?php echo htmlspecialchars((string)$usdt['wallet_name']); ?>"></td>
+                          <td><input name="wallet_address" class="form-control form-control-premium py-1" value="<?php echo htmlspecialchars((string)$usdt['wallet_address']); ?>"></td>
+                          <td><input name="network" class="form-control form-control-premium py-1" style="width: 110px;" value="<?php echo htmlspecialchars((string)$usdt['network']); ?>"></td>
+                          <td>
+                            <input type="number" step="0.01" name="min_amount" class="form-control form-control-premium py-1 d-inline-block" style="width: 85px;" value="<?php echo (float)$usdt['min_amount']; ?>"> -
+                            <input type="number" step="0.01" name="max_amount" class="form-control form-control-premium py-1 d-inline-block" style="width: 95px;" value="<?php echo (float)$usdt['max_amount']; ?>">
+                          </td>
+                          <td><input type="number" name="sort_order" class="form-control form-control-premium py-1" style="width: 70px;" value="<?php echo (int)($usdt['sort_order'] ?? 0); ?>"></td>
+                          <td>
+                            <select name="enabled" class="form-control form-control-premium py-1">
+                              <option value="1" <?php echo !empty($usdt['enabled']) ? 'selected' : ''; ?>>Active</option>
+                              <option value="0" <?php echo empty($usdt['enabled']) ? 'selected' : ''; ?>>Paused</option>
+                            </select>
+                          </td>
+                          <td class="text-end">
+                            <button type="submit" class="btn btn-sm btn-premium py-1">Save</button>
+                            <button type="submit" formaction="api.php" name="action" value="delete_usdt" class="btn btn-sm btn-outline-danger py-1" onclick="return confirm('Delete this USDT wallet?');">Delete</button>
+                          </td>
+                        </form>
+                      </tr>
+                    <?php endforeach; ?>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <!-- ============================================================= -->
+        <!-- USDT RATE                                                    -->
+        <!-- ============================================================= -->
+        <?php if ($tab === 'usdt_rate'):
+          $usdtRate = api_setting_float('usdt_rate', 90.0);
+          if ($usdtRate <= 0) { $usdtRate = 90.0; }
+          $usdtMethodsForRate = SettingsController::getUsdtMethods();
+        ?>
+          <div id="usdt-rate-view">
+            <h2 class="fw-bold mb-2"><i class="fas fa-rupee-sign text-gold me-2"></i> USDT Rate</h2>
+            <p class="text-secondary">Conversion rate used for crypto deposits: how many rupees one USDT is worth.</p>
+
+            <div class="row g-4">
+              <div class="col-lg-5">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-sliders-h me-2"></i> Rate Settings</h4>
+                  <form action="api.php" method="post" class="row g-3 mb-3">
+                    <input type="hidden" name="action" value="save_setting">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="usdt_rate">
+                    <input type="hidden" name="setting_key" value="usdt_rate">
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">1 USDT = ₹</label>
+                      <input type="number" step="0.01" min="0" name="setting_value" class="form-control form-control-premium" value="<?php echo htmlspecialchars((string)$usdtRate); ?>">
+                    </div>
+                    <div class="col-12"><button type="submit" class="btn btn-premium btn-sm">Save USDT Rate</button></div>
+                  </form>
+
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="save_setting">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="usdt_rate">
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Minimum USDT Deposit</label>
+                      <input type="number" step="0.01" min="0" name="setting_value" class="form-control form-control-premium" value="<?php echo htmlspecialchars(api_setting('usdt_min_amount', '10')); ?>">
+                      <input type="hidden" name="setting_key" value="usdt_min_amount">
+                    </div>
+                    <div class="col-md-6 d-flex align-items-end">
+                      <button type="submit" class="btn btn-premium btn-sm w-100">Save Minimum</button>
+                    </div>
+                  </form>
+
+                  <form action="api.php" method="post" class="row g-3 mt-1">
+                    <input type="hidden" name="action" value="save_setting">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="usdt_rate">
+                    <div class="col-md-6">
+                      <label class="form-label text-secondary small fw-bold">Maximum USDT Deposit</label>
+                      <input type="number" step="0.01" min="0" name="setting_value" class="form-control form-control-premium" value="<?php echo htmlspecialchars(api_setting('usdt_max_amount', '10000')); ?>">
+                      <input type="hidden" name="setting_key" value="usdt_max_amount">
+                    </div>
+                    <div class="col-md-6 d-flex align-items-end">
+                      <button type="submit" class="btn btn-premium btn-sm w-100">Save Maximum</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+
+              <div class="col-lg-7">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-calculator me-2"></i> Live Conversion Converter</h4>
+                  <div class="input-group mb-3">
+                    <input type="number" step="0.01" id="usdt-convert-input" class="form-control form-control-premium" value="100" data-rate="<?php echo htmlspecialchars((string)$usdtRate); ?>">
+                    <span class="input-group-text border-0" style="background: rgba(7,9,19,0.6); color: var(--text-muted);">USDT</span>
+                    <span class="input-group-text border-0" style="background: rgba(7,9,19,0.6); color: var(--text-muted);">=</span>
+                    <span class="input-group-text border-0 fw-bold text-gold" id="usdt-convert-output" style="background: rgba(7,9,19,0.6);">₹<?php echo number_format(100 * $usdtRate, 2); ?></span>
+                  </div>
+                  <div class="table-responsive table-responsive-premium">
+                    <table class="table align-middle">
+                      <thead>
+                        <tr><th>USDT Wallet</th><th>Network</th><th>Min</th><th>Max</th><th>Status</th></tr>
+                      </thead>
+                      <tbody>
+                        <?php if (empty($usdtMethodsForRate)): ?>
+                          <tr><td colspan="5" class="text-center text-muted">No USDT wallet yet. Add one from <a href="/admin/?tab=add_usdt" class="text-gold">Add USDT</a>.</td></tr>
+                        <?php endif; ?>
+                        <?php foreach ($usdtMethodsForRate as $row): ?>
+                          <tr>
+                            <td class="fw-bold text-white"><?php echo htmlspecialchars((string)$row['wallet_name']); ?></td>
+                            <td><?php echo htmlspecialchars((string)$row['network']); ?></td>
+                            <td><?php echo (float)$row['min_amount']; ?> USDT</td>
+                            <td><?php echo (float)$row['max_amount']; ?> USDT</td>
+                            <td>
+                              <?php if (!empty($row['enabled'])): ?>
+                                <span class="badge bg-success">Active</span>
+                              <?php else: ?>
+                                <span class="badge bg-secondary">Paused</span>
+                              <?php endif; ?>
+                            </td>
+                          </tr>
+                        <?php endforeach; ?>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <!-- ============================================================= -->
+        <!-- GATEWAY IMAGE UPLOAD (UPI / USDT)                            -->
+        <!-- ============================================================= -->
+        <?php
+          $imageViews = [
+              'add_upi_image'  => ['table' => 'payment_methods', 'action' => 'save_payment_image', 'title' => 'Add UPI Image', 'icon' => 'fa-qrcode', 'label' => 'UPI Account'],
+              'add_usdt_image' => ['table' => 'usdt_methods', 'action' => 'save_usdt_image', 'title' => 'Add USDT Image', 'icon' => 'fa-file-image', 'label' => 'USDT Wallet'],
+          ];
+        ?>
+        <?php if (isset($imageViews[$tab])):
+          $imageView = $imageViews[$tab];
+          $imageRows = $imageView['table'] === 'payment_methods' ? SettingsController::getPaymentMethods() : SettingsController::getUsdtMethods();
+        ?>
+          <div id="gateway-image-view">
+            <h2 class="fw-bold mb-2"><i class="fas <?php echo $imageView['icon']; ?> text-gold me-2"></i> <?php echo htmlspecialchars($imageView['title']); ?></h2>
+            <p class="text-secondary">Upload the QR / logo image of a <?php echo htmlspecialchars($imageView['label']); ?>. The image is shown to members on the deposit page.</p>
+
+            <div class="glass-panel p-4 mb-4">
+              <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-upload me-2"></i> Upload Image</h4>
+              <form action="api.php" method="post" enctype="multipart/form-data" class="row g-3">
+                <input type="hidden" name="action" value="<?php echo $imageView['action']; ?>">
+                <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                <input type="hidden" name="return_tab" value="<?php echo $tab; ?>">
+                <div class="col-md-4">
+                  <label class="form-label text-secondary small fw-bold"><?php echo htmlspecialchars($imageView['label']); ?> *</label>
+                  <select name="id" class="form-control form-control-premium" required>
+                    <option value="">-- choose --</option>
+                    <?php foreach ($imageRows as $row): ?>
+                      <?php $rowName = $imageView['table'] === 'payment_methods' ? (string)$row['method_name'] : (string)$row['wallet_name']; ?>
+                      <option value="<?php echo (int)$row['id']; ?>"><?php echo htmlspecialchars($rowName); ?></option>
+                    <?php endforeach; ?>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label text-secondary small fw-bold">Image File</label>
+                  <input type="file" name="image" accept="image/png,image/jpeg,image/webp,image/gif" class="form-control form-control-premium">
+                  <span class="text-muted small">PNG / JPG / WEBP up to the server upload limit.</span>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label text-secondary small fw-bold">Or Image URL</label>
+                  <input name="image_url" class="form-control form-control-premium" placeholder="https://... / /img/qr.png">
+                  <span class="text-muted small">Use this if the file is already hosted.</span>
+                </div>
+                <div class="col-12">
+                  <button type="submit" class="btn btn-premium"><i class="fas fa-save me-1"></i> Save Image</button>
+                </div>
+              </form>
+            </div>
+
+            <div class="glass-panel p-4">
+              <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-images me-2"></i> Current Images</h4>
+              <div class="row g-3">
+                <?php if (empty($imageRows)): ?>
+                  <div class="col-12 text-center text-muted">Nothing added yet.</div>
+                <?php endif; ?>
+                <?php foreach ($imageRows as $row): ?>
+                  <?php
+                    $rowName = $imageView['table'] === 'payment_methods' ? (string)$row['method_name'] : (string)$row['wallet_name'];
+                    $rowImage = trim((string)($row['icon_url'] ?? ''));
+                    if ($rowImage === '') { $rowImage = trim((string)($row['qr_image'] ?? '')); }
+                  ?>
+                  <div class="col-md-4">
+                    <div class="glass-panel p-3 h-100 text-center">
+                      <?php if ($rowImage !== ''): ?>
+                        <img src="<?php echo htmlspecialchars($rowImage); ?>" alt="QR" style="max-width: 140px; max-height: 140px; border-radius: 12px; margin-bottom: 10px; background: #fff; padding: 6px;">
+                      <?php else: ?>
+                        <div class="text-muted mb-2" style="font-size: 40px;"><i class="fas fa-image"></i></div>
+                      <?php endif; ?>
+                      <div class="fw-bold text-white"><?php echo htmlspecialchars($rowName); ?></div>
+                      <div class="text-muted small"><?php echo htmlspecialchars($imageView['table'] === 'payment_methods' ? (string)$row['account_value'] : (string)$row['wallet_address']); ?></div>
+                      <?php if (!empty($row['enabled'])): ?>
+                        <span class="badge bg-success mt-2">Active</span>
+                      <?php else: ?>
+                        <span class="badge bg-secondary mt-2">Paused</span>
+                      <?php endif; ?>
+                    </div>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <!-- ============================================================= -->
+        <!-- WITHDRAW VIEWS: UPI / SENT / REJECTED                        -->
+        <!-- ============================================================= -->
+        <?php
+          $withdrawViews = [
+              'upi_withdraw'    => ['title' => 'UPI Withdraw Requests', 'status' => 'Pending', 'type' => 'UPI', 'icon' => 'fa-mobile-alt', 'note' => 'Pending UPI payout requests waiting for approval.'],
+              'withdraw_sent'   => ['title' => 'Withdraw Sent', 'status' => 'Approved', 'type' => '', 'icon' => 'fa-paper-plane', 'note' => 'Approved payouts that were sent to members.'],
+              'withdraw_reject' => ['title' => 'Withdraw Rejected', 'status' => 'Rejected', 'type' => '', 'icon' => 'fa-ban', 'note' => 'Rejected requests - the amount is returned to the member wallet automatically.'],
+          ];
+        ?>
+        <?php if (isset($withdrawViews[$tab])):
+          $wv = $withdrawViews[$tab];
+        ?>
+          <div id="withdraw-view">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
+              <div>
+                <h2 class="fw-bold mb-1"><i class="fas <?php echo $wv['icon']; ?> text-gold me-2"></i> <?php echo htmlspecialchars($wv['title']); ?></h2>
+                <p class="text-secondary mb-0"><?php echo htmlspecialchars($wv['note']); ?></p>
+              </div>
+              <div class="d-flex gap-2">
+                <select id="payout-status-filter" class="form-select form-control-premium" style="width: 180px;">
+                  <option value="">All Statuses</option>
+                  <option value="Pending" <?php echo $wv['status'] === 'Pending' ? 'selected' : ''; ?>>Pending</option>
+                  <option value="Approved" <?php echo $wv['status'] === 'Approved' ? 'selected' : ''; ?>>Approved / Sent</option>
+                  <option value="Rejected" <?php echo $wv['status'] === 'Rejected' ? 'selected' : ''; ?>>Rejected</option>
+                </select>
+                <a href="/admin/?tab=withdrawals" class="btn btn-secondary-premium"><i class="fas fa-list me-1"></i> All Payouts</a>
+              </div>
+            </div>
+
+            <div class="glass-panel p-4">
+              <div class="table-responsive table-responsive-premium">
+                <table class="table align-middle" id="payout-table" data-payout-status="<?php echo htmlspecialchars($wv['status']); ?>" data-payout-type="<?php echo htmlspecialchars($wv['type']); ?>">
+                  <thead>
+                    <tr>
+                      <th>Order No</th>
+                      <th>Player ID</th>
+                      <th>Username</th>
+                      <th>Amount</th>
+                      <th>Type</th>
+                      <th>Status</th>
+                      <th>Account</th>
+                      <th>Remarks</th>
+                      <th class="text-end">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr><td colspan="9" class="text-center text-muted">Loading payout requests...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <!-- ============================================================= -->
+        <!-- SUPPORT CATEGORY QUEUES                                      -->
+        <!-- ============================================================= -->
+        <?php
+          $supportViews = [
+              'support_deposit'  => ['title' => 'Deposit Problem Tickets', 'icon' => 'fa-arrow-alt-circle-down', 'note' => 'Members reporting deposit not credited / UTR issues.'],
+              'support_withdraw' => ['title' => 'Withdrawal Problem Tickets', 'icon' => 'fa-arrow-alt-circle-up', 'note' => 'Members reporting payout delays or failures.'],
+              'support_ifsc'     => ['title' => 'IFSC Modification Tickets', 'icon' => 'fa-university', 'note' => 'Bank IFSC correction requests.'],
+              'support_bank'     => ['title' => 'Bank Modification Tickets', 'icon' => 'fa-credit-card', 'note' => 'Bank account / card change requests.'],
+              'support_game'     => ['title' => 'Game Problem Tickets', 'icon' => 'fa-gamepad', 'note' => 'Bet, result or in-game balance complaints.'],
+          ];
+        ?>
+        <?php if (isset($supportViews[$tab])):
+          $sv = $supportViews[$tab];
+          $counts = SupportController::categoryCounts();
+          $myCount = (int)($counts[$tab] ?? 0);
+        ?>
+          <div id="support-category-view" data-support-category="<?php echo $tab; ?>">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
+              <div>
+                <h2 class="fw-bold mb-1"><i class="fas <?php echo $sv['icon']; ?> text-gold me-2"></i> <?php echo htmlspecialchars($sv['title']); ?></h2>
+                <p class="text-secondary mb-0"><?php echo htmlspecialchars($sv['note']); ?></p>
+              </div>
+              <div class="d-flex gap-2 align-items-center">
+                <span class="badge bg-danger fs-6 py-2 px-3"><?php echo $myCount; ?> open / total</span>
+                <select id="support-status-filter" class="form-select form-control-premium" style="width: 170px;">
+                  <option value="">All Statuses</option>
+                  <option value="open">Open</option>
+                  <option value="replied">Replied</option>
+                  <option value="closed">Closed</option>
+                </select>
+                <a href="/admin/?tab=support" class="btn btn-secondary-premium"><i class="fas fa-inbox me-1"></i> All Tickets</a>
+              </div>
+            </div>
+
+            <div class="row g-4">
+              <div class="col-xl-8">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-ticket-alt me-2"></i> Ticket Queue</h4>
+                  <div class="table-responsive table-responsive-premium">
+                    <table class="table align-middle" id="support-tickets-table">
+                      <thead>
+                        <tr>
+                          <th>Title</th>
+                          <th>User</th>
+                          <th>Order No</th>
+                          <th>Status</th>
+                          <th>Last Update</th>
+                          <th class="text-end">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr><td colspan="6" class="text-center text-muted">Loading tickets...</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-xl-4">
+                <div class="glass-panel p-4 h-100">
+                  <h4 class="fw-bold mb-3 text-gold"><i class="fas fa-plus-circle me-2"></i> Create Ticket</h4>
+                  <p class="text-secondary small">Members can also raise these tickets from the site's Self Service Center - they land in this queue automatically.</p>
+                  <form action="api.php" method="post" class="row g-3">
+                    <input type="hidden" name="action" value="create_ticket">
+                    <input type="hidden" name="csrf" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="return_tab" value="<?php echo $tab; ?>">
+                    <input type="hidden" name="category" value="<?php echo $tab; ?>">
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">Member</label>
+                      <select name="user_id" class="form-control form-control-premium">
+                        <option value="0">-- first member (default) --</option>
+                        <?php foreach (admin_db_rows("SELECT id, user_id, username FROM api_users ORDER BY id DESC LIMIT 300") as $opt): ?>
+                          <option value="<?php echo (int)$opt['id']; ?>"><?php echo htmlspecialchars($opt['username'] . ' (' . $opt['user_id'] . ')'); ?></option>
+                        <?php endforeach; ?>
+                      </select>
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">Title</label>
+                      <input name="title" class="form-control form-control-premium" placeholder="<?php echo htmlspecialchars($sv['title']); ?>">
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">Order No (optional)</label>
+                      <input name="order_no" class="form-control form-control-premium" placeholder="RC... / WD...">
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label text-secondary small fw-bold">Message</label>
+                      <textarea name="message" class="form-control form-control-premium" style="min-height: 90px;" placeholder="Problem details..."></textarea>
+                    </div>
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-premium w-100 justify-content-center"><i class="fas fa-plus me-1"></i> Create Ticket</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            </div>
+
+            <?php require __DIR__ . '/views/support-chat-modal.php'; ?>
           </div>
         <?php endif; ?>
 

@@ -98,12 +98,90 @@ class SettingsController
                 $stmt = $pdo->prepare("UPDATE usdt_methods SET wallet_name = ?, wallet_address = ?, network = ?, qr_text = ?, min_amount = ?, max_amount = ?, sort_order = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
                 $stmt->execute([$name, $address, $network, $qrText, $min, $max, $sort, $enabled, $id]);
             } else {
-                $stmt = $pdo->prepare("INSERT INTO usdt_methods (wallet_name, wallet_address, network, qr_text, min_amount, max_amount, sort_order, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                $stmt = $pdo->prepare("INSERT INTO usdt_methods (wallet_name, wallet_address, network, qr_text, min_amount, max_amount, sort_order, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
                 $stmt->execute([$name, $address, $network, $qrText, $min, $max, $sort, $enabled]);
             }
             return ['success' => true, 'message' => 'USDT method saved successfully'];
         } catch (Throwable $e) {
             return ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+        }
+    }
+
+    /**
+     * Upload (or link) a QR / gateway image for a UPI or USDT method and store
+     * it in the rows the site's deposit page reads.
+     */
+    public static function saveGatewayImage(string $table, int $id, array $post, array $files = []): array
+    {
+        $pdo = api_pdo();
+        if (!$pdo) {
+            return ['success' => false, 'message' => 'Database not available'];
+        }
+        if (!in_array($table, ['payment_methods', 'usdt_methods'], true)) {
+            return ['success' => false, 'message' => 'Invalid gateway table'];
+        }
+
+        $imageUrl = trim((string)($post['image_url'] ?? ''));
+        $imageData = (string)($post['image_data'] ?? '');
+
+        // 1) Real file upload (multipart form from the panel)
+        if (!empty($files['image']['tmp_name']) && is_uploaded_file((string)$files['image']['tmp_name'])) {
+            $original = (string)($files['image']['name'] ?? 'qr.png');
+            $extension = strtolower((string)pathinfo($original, PATHINFO_EXTENSION));
+            if (!in_array($extension, ['png', 'jpg', 'jpeg', 'webp', 'gif'], true)) {
+                $extension = 'png';
+            }
+            $uploadDir = dirname(__DIR__, 2) . '/uploads/gateways';
+            if (!is_dir($uploadDir)) {
+                @mkdir($uploadDir, 0775, true);
+            }
+            $fileName = $table . '-' . $id . '-' . substr(md5((string)microtime(true)), 0, 8) . '.' . $extension;
+            $target = $uploadDir . '/' . $fileName;
+            if (!@move_uploaded_file((string)$files['image']['tmp_name'], $target)) {
+                return ['success' => false, 'message' => 'Could not store the uploaded image (check folder permissions on /uploads)'];
+            }
+            @chmod($target, 0644);
+            $imageUrl = '/uploads/gateways/' . $fileName;
+        } elseif ($imageData !== '' && preg_match('#^data:image/[a-z]+;base64,#i', $imageData)) {
+            // 2) Base64 image pasted into the panel
+            $parts = explode(',', $imageData, 2);
+            $binary = base64_decode((string)($parts[1] ?? ''), true);
+            if ($binary === false) {
+                return ['success' => false, 'message' => 'Invalid base64 image data'];
+            }
+            $uploadDir = dirname(__DIR__, 2) . '/uploads/gateways';
+            if (!is_dir($uploadDir)) {
+                @mkdir($uploadDir, 0775, true);
+            }
+            $fileName = $table . '-' . $id . '-' . substr(md5((string)microtime(true)), 0, 8) . '.png';
+            if (@file_put_contents($uploadDir . '/' . $fileName, $binary) === false) {
+                return ['success' => false, 'message' => 'Could not store the pasted image'];
+            }
+            $imageUrl = '/uploads/gateways/' . $fileName;
+        }
+
+        if ($imageUrl === '') {
+            return ['success' => false, 'message' => 'Choose an image file or paste an image URL first'];
+        }
+
+        try {
+            $stmt = $pdo->prepare("UPDATE `$table` SET qr_image = ?, icon_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+            $stmt->execute([$imageUrl, $imageUrl, $id]);
+            if ($stmt->rowCount() < 1) {
+                // Row may not have an updated_at column on very old installs.
+                $stmt = $pdo->prepare("UPDATE `$table` SET qr_image = ?, icon_url = ? WHERE id = ?");
+                $stmt->execute([$imageUrl, $imageUrl, $id]);
+            }
+            return ['success' => true, 'message' => 'Gateway image saved', 'image_url' => $imageUrl];
+        } catch (Throwable $e) {
+            // Retry without updated_at so the image still gets stored.
+            try {
+                $stmt = $pdo->prepare("UPDATE `$table` SET qr_image = ?, icon_url = ? WHERE id = ?");
+                $stmt->execute([$imageUrl, $imageUrl, $id]);
+                return ['success' => true, 'message' => 'Gateway image saved', 'image_url' => $imageUrl];
+            } catch (Throwable $e2) {
+                return ['success' => false, 'message' => 'Error: ' . $e2->getMessage()];
+            }
         }
     }
 

@@ -26,3 +26,11 @@ Stack trace:
 Stack trace:
 #0 {main}
   thrown in /home/club532583/dhaniwin.club9.eu.cc/admin/index.php on line 1000
+[05-Oct-2026 00:44:40 Asia/Kolkata] PHP Fatal error:  Uncaught Error: Call to undefined function str_contains() in /home/club532583/dhaniwin.club9.eu.cc/admin/api.php:75
+Stack trace:
+#0 {main}
+  thrown in /home/club532583/dhaniwin.club9.eu.cc/admin/api.php on line 75
+[05-Oct-2026 01:25:11 Asia/Kolkata] PHP Fatal error:  Uncaught Error: Call to undefined function str_contains() in /home/club532583/dhaniwin.club9.eu.cc/admin/api.php:75
+Stack trace:
+#0 {main}
+  thrown in /home/club532583/dhaniwin.club9.eu.cc/admin/api.php on line 75

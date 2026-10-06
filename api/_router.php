@@ -1,5 +1,5 @@
 <?php
-require __DIR__ . '/_bootstrap.php';
+require_once __DIR__ . '/_bootstrap.php';
 
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
     api_headers();
@@ -28,15 +28,22 @@ if (function_exists('lottery_upstream_handle_endpoint')) {
     }
 }
 
-$override = api_get_override($endpoint);
-if ($override) {
-    $decoded = api_json_decode_lenient((string) $override['content']);
-    if ($decoded['ok']) {
-        $payload = $decoded['data'];
-        api_refresh_times($payload);
-        api_emit($payload);
+// Endpoints that must always answer from the database. The site also keeps
+// saved "reference" responses (api_responses) for many endpoints, but a saved
+// balance snapshot must never win over the live value - that is what made an
+// admin credit or an approved deposit invisible on the site.
+$liveEndpoints = api_live_endpoints();
+if (!in_array(strtolower($endpoint), $liveEndpoints, true)) {
+    $override = api_get_override($endpoint);
+    if ($override) {
+        $decoded = api_json_decode_lenient((string) $override['content']);
+        if ($decoded['ok']) {
+            $payload = $decoded['data'];
+            api_refresh_times($payload);
+            api_emit($payload);
+        }
+        api_emit(api_error('Saved override JSON is invalid: ' . $decoded['error'], 500));
     }
-    api_emit(api_error('Saved override JSON is invalid: ' . $decoded['error'], 500));
 }
 
 // Load and execute physical subfolder PHP endpoint files if they exist and are not router stubs

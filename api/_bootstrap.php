@@ -199,6 +199,674 @@ function api_db_driver(?PDO $pdo = null): string
     return (string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
 }
 
+// ---------------------------------------------------------------------------
+// Balance helpers. Dhani.win stores the player money in two columns
+// (api_users.wallet_balance = site wallet, api_users.game_balance = WinGo game
+// wallet). They must always hold the same amount, so every change goes through
+// the two helpers below instead of writing one column on its own.
+// ---------------------------------------------------------------------------
+
+/** Return the columns that currently exist on a table (lower-cased names). */
+function api_schema_columns(PDO $pdo, string $table): array
+{
+    try {
+        if (api_db_driver($pdo) === 'mysql') {
+            $rows = $pdo->query("SHOW COLUMNS FROM `" . $table . "`")->fetchAll();
+            $names = [];
+            foreach ($rows as $row) {
+                $names[] = strtolower((string) ($row['Field'] ?? ''));
+            }
+            return $names;
+        }
+        $rows = $pdo->query("PRAGMA table_info(" . $table . ")")->fetchAll();
+        $names = [];
+        foreach ($rows as $row) {
+            $names[] = strtolower((string) ($row['name'] ?? ''));
+        }
+        return $names;
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/** Add the columns a table is missing (old installs never got the ALTERs). */
+function api_ensure_columns(PDO $pdo, string $table, array $columns): void
+{
+    $existing = api_schema_columns($pdo, $table);
+    if (!$existing) {
+        return;
+    }
+    $mysql = api_db_driver($pdo) === 'mysql';
+    foreach ($columns as $name => $spec) {
+        if (in_array(strtolower((string) $name), $existing, true)) {
+            continue;
+        }
+        $type = $mysql ? ($spec['mysql'] ?? '') : ($spec['sqlite'] ?? '');
+        if ($type === '') {
+            continue;
+        }
+        try {
+            $pdo->exec("ALTER TABLE `" . $table . "` ADD COLUMN `" . $name . "` " . $type);
+        } catch (Throwable $e) {
+            // Column already exists or the engine refused it: keep going.
+        }
+    }
+}
+
+/**
+ * Columns added after the first release. They are repaired on every request
+ * (api_ensure_columns only runs an ALTER when the column is really missing)
+ * so old cPanel databases keep working without a manual migration.
+ */
+function api_ensure_runtime_columns(PDO $pdo, bool $force = false): void
+{
+    static $done = [];
+    $key = spl_object_hash($pdo);
+    if ($force) {
+        // The schema repair just created a table that did not exist during the
+        // first pass, so run the column check once more for this connection.
+        unset($done[$key]);
+    }
+    if (isset($done[$key])) {
+        return;
+    }
+    $done[$key] = true;
+
+    $text = ['mysql' => 'TEXT NULL', 'sqlite' => 'TEXT NULL'];
+    $int  = ['mysql' => 'INT NOT NULL DEFAULT 0', 'sqlite' => 'INTEGER NOT NULL DEFAULT 0'];
+
+    // Player flags used by the admin panel (demo users, agent users, bans)
+    api_ensure_columns($pdo, 'api_users', [
+        'is_demo' => $int,
+        'is_agent' => $int,
+        'agent_rate' => ['mysql' => 'DECIMAL(10,2) NOT NULL DEFAULT 0', 'sqlite' => 'REAL NOT NULL DEFAULT 0'],
+        'ban_reason' => $text,
+        'last_login_at' => $text,
+    ]);
+
+    // Payment gateways: QR / icon image uploaded from the admin panel
+    api_ensure_columns($pdo, 'payment_methods', [
+        'qr_image' => $text,
+        'icon_url' => $text,
+        'account_holder' => $text,
+    ]);
+    api_ensure_columns($pdo, 'usdt_methods', [
+        'qr_image' => $text,
+        'icon_url' => $text,
+    ]);
+
+    // Deposit orders: columns the admin panel reads / writes
+    api_ensure_columns($pdo, 'recharge_orders', [
+        'payment_type' => $text,
+        'screenshot_url' => $text,
+        'remarks' => $text,
+        'bonus_amount' => ['mysql' => 'DECIMAL(18,4) NOT NULL DEFAULT 0', 'sqlite' => 'REAL NOT NULL DEFAULT 0'],
+        'processed_by' => $int,
+        'processed_at' => $text,
+    ]);
+
+    // Withdrawal orders: remarks/processed_* are needed by Approve/Reject
+    api_ensure_columns($pdo, 'withdraw_orders', [
+        'remarks' => $text,
+        'processed_by' => $int,
+        'processed_at' => $text,
+        'payment_type' => $text,
+    ]);
+
+    // Support tickets: category drives the support_* tabs of the panel
+    api_ensure_columns($pdo, 'support_tickets', [
+        'category' => $text,
+        'priority' => $text,
+        'order_no' => $text,
+        'assigned_to' => $int,
+        'last_reply_at' => $text,
+    ]);
+    api_ensure_columns($pdo, 'ticket_replies', [
+        'attachment' => $text,
+    ]);
+
+    // Gift codes: enable/disable + who created them
+    api_ensure_columns($pdo, 'gift_codes', [
+        'enabled' => ['mysql' => 'TINYINT(1) NOT NULL DEFAULT 1', 'sqlite' => 'INTEGER NOT NULL DEFAULT 1'],
+        'created_by' => $int,
+        'used_by' => $text,
+    ]);
+}
+
+/**
+ * The single "real" balance of a user.
+ * Both columns normally hold the same value; if an old database still has two
+ * different values (wallet + game were separate pools before) the user's money
+ * is the sum of both.
+ */
+function api_wallet_balance_of(array $user): float
+{
+    $wallet = (float) ($user['wallet_balance'] ?? 0);
+    $game = (float) ($user['game_balance'] ?? 0);
+    if (abs($wallet - $game) < 0.0000001) {
+        return round($wallet, 4);
+    }
+    // Row from before the wallets were unified: the player's money is the two
+    // old pools added together. Mirror the row so every screen reads one value.
+    $total = round($wallet + $game, 4);
+    $rowId = (int) ($user['id'] ?? 0);
+    if ($rowId > 0) {
+        api_wallet_mirror_user($rowId, $total);
+    }
+    return $total;
+}
+
+/** Best-effort wallet log. A failed log must never block a balance change. */
+function api_wallet_log_insert(int $playerUserId, string $type, float $amount, float $before, float $after, string $notes = ''): void
+{
+    $pdo = api_pdo();
+    if (!$pdo) {
+        return;
+    }
+    try {
+        $stmt = $pdo->prepare("INSERT INTO wallet_logs (user_id, type, amount, balance_before, balance_after, notes) VALUES (?, ?, ?, ?, ?, ?)");
+        $stmt->execute([$playerUserId, $type, round($amount, 4), round($before, 4), round($after, 4), $notes]);
+    } catch (Throwable $e) {
+        // wallet_logs may be missing on very old installs; the balance change wins.
+    }
+}
+
+/**
+ * Credit/debit a user by row id and mirror the result into both balance
+ * columns, so the site wallet and the game wallet always show the same money.
+ */
+function api_wallet_apply_change(int $dbUserId, float $delta, string $type = 'wallet', string $notes = ''): array
+{
+    $pdo = api_pdo();
+    if (!$pdo) {
+        return ['success' => false, 'message' => 'Database not available'];
+    }
+    if (abs($delta) < 0.0000001) {
+        return ['success' => false, 'message' => 'Amount cannot be zero'];
+    }
+
+    try {
+        $stmt = $pdo->prepare("SELECT id, user_id, wallet_balance, game_balance FROM api_users WHERE id = ? LIMIT 1");
+        $stmt->execute([$dbUserId]);
+        $user = $stmt->fetch();
+        if (!$user) {
+            return ['success' => false, 'message' => 'User not found'];
+        }
+
+        $before = api_wallet_balance_of($user);
+        $after = round($before + $delta, 4);
+        if ($after < 0) {
+            return ['success' => false, 'message' => 'Insufficient balance for deduction'];
+        }
+
+        $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = ?, game_balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+        $stmt->execute([$after, $after, $user['id']]);
+
+        api_wallet_log_insert((int) $user['user_id'], $type, $delta, $before, $after, $notes);
+
+        // Keep any later read in this same request (site payloads, admin flash)
+        // in sync with the fresh balance.
+        api_primary_user(true);
+
+        return ['success' => true, 'message' => 'Balance updated', 'balance' => $after, 'new_balance' => $after];
+    } catch (Throwable $e) {
+        return ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+    }
+}
+
+/** Keep both columns identical for one user (row id) without touching the amount. */
+function api_wallet_mirror_user(int $dbUserId, ?float $balance = null): ?float
+{
+    $pdo = api_pdo();
+    if (!$pdo) {
+        return null;
+    }
+    try {
+        $stmt = $pdo->prepare("SELECT id, wallet_balance, game_balance FROM api_users WHERE id = ? LIMIT 1");
+        $stmt->execute([$dbUserId]);
+        $user = $stmt->fetch();
+        if (!$user) {
+            return null;
+        }
+        $value = $balance === null ? api_wallet_balance_of($user) : round($balance, 4);
+        if (abs((float) $user['wallet_balance'] - $value) < 0.0000001 && abs((float) $user['game_balance'] - $value) < 0.0000001) {
+            return $value;
+        }
+        $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = ?, game_balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+        $stmt->execute([$value, $value, $user['id']]);
+        return $value;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * One-time migration: older databases kept two separate pools (wallet and game).
+ * From this build on both columns show the same money, so every user gets the
+ * sum of what he had in the two columns - nobody loses or gains a rupee.
+ */
+function api_wallet_migrate_balances(PDO $pdo): void
+{
+    static $ran = false;
+    if ($ran) {
+        return;
+    }
+    $ran = true;
+
+    try {
+        $stmt = $pdo->prepare("SELECT setting_value FROM api_settings WHERE setting_key = 'wallet_game_unified' LIMIT 1");
+        $stmt->execute();
+        if ((string) $stmt->fetchColumn() === '1') {
+            return;
+        }
+    } catch (Throwable $e) {
+        return; // no settings table yet - the main schema pass will create it
+    }
+
+    // This pass used to run on every single request when the settings write
+    // failed on a locked-down MySQL host, and it fetched every player row first.
+    // A file marker keeps it off, and only rows that really hold two different
+    // pools are touched (bounded per run).
+    $marker = api_storage_dir() . '/.wallet_unified';
+    if (is_file($marker)) {
+        return;
+    }
+
+    $merged = [];
+    try {
+        $rows = $pdo->query("SELECT id, user_id, wallet_balance, game_balance FROM api_users WHERE ABS(wallet_balance - game_balance) > 0.0000001 LIMIT 500")->fetchAll();
+
+        foreach ($rows as $row) {
+            $wallet = (float) $row['wallet_balance'];
+            $game = (float) $row['game_balance'];
+            if (abs($wallet - $game) < 0.0000001) {
+                continue;
+            }
+            // The user's money does not change here: wallet + game (two old pools)
+            // is now shown in both columns as one balance.
+            $total = round($wallet + $game, 4);
+            $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = ?, game_balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+            $stmt->execute([$total, $total, $row['id']]);
+            $merged[] = ['user_id' => (int) $row['user_id'], 'wallet' => $wallet, 'game' => $game, 'balance' => $total];
+        }
+    } catch (Throwable $e) {
+        return;
+    }
+
+    try {
+        $stmt = $pdo->prepare("SELECT id FROM api_settings WHERE setting_key = 'wallet_game_unified' LIMIT 1");
+        $stmt->execute();
+        if ($stmt->fetch()) {
+            $stmt = $pdo->prepare("UPDATE api_settings SET setting_value = '1', updated_at = CURRENT_TIMESTAMP WHERE setting_key = 'wallet_game_unified'");
+            $stmt->execute();
+        } else {
+            $stmt = $pdo->prepare("INSERT INTO api_settings (setting_key, setting_value) VALUES ('wallet_game_unified', '1')");
+            $stmt->execute();
+        }
+    } catch (Throwable $e) {
+    }
+
+    @file_put_contents($marker, '1');
+    api_audit('wallet_game_unified', 'api_users', ['merged' => $merged, 'note' => 'wallet_balance and game_balance now show the same amount']);
+}
+
+
+/**
+ * Safety net for cPanel upgrades: make sure every table/column the panel and
+ * the site need really exists, even when the fast schema check below passes on
+ * an older database. Each statement is idempotent and the whole block only runs
+ * once per deployment (tracked through the .schema_v2 marker).
+ */
+function api_self_heal_core_schema(PDO $pdo, string $driver): void
+{
+    $mysql = $driver === 'mysql';
+
+    $ddl = [];
+    if ($mysql) {
+        $ddl[] = "CREATE TABLE IF NOT EXISTS api_users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            username VARCHAR(120) NOT NULL,
+            nickname VARCHAR(120) NULL,
+            phone VARCHAR(80) NULL,
+            wallet_balance DECIMAL(18,4) NOT NULL DEFAULT 0,
+            game_balance DECIMAL(18,4) NOT NULL DEFAULT 0,
+            can_bet TINYINT(1) NOT NULL DEFAULT 1,
+            password VARCHAR(255) NULL,
+            token VARCHAR(255) NULL,
+            token_expire BIGINT NULL,
+            referrer_id BIGINT NULL,
+            status TINYINT(1) NOT NULL DEFAULT 1,
+            vipLevel INT NOT NULL DEFAULT 0,
+            raw_json LONGTEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS wallet_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            type VARCHAR(50) NOT NULL,
+            amount DECIMAL(18,4) NOT NULL,
+            balance_before DECIMAL(18,4) NOT NULL,
+            balance_after DECIMAL(18,4) NOT NULL,
+            notes TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS payment_methods (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            method_name VARCHAR(190) NOT NULL,
+            method_type VARCHAR(40) NOT NULL DEFAULT 'UPI',
+            account_name VARCHAR(190) NULL,
+            account_value VARCHAR(190) NULL,
+            qr_text TEXT NULL,
+            min_amount DECIMAL(18,4) NOT NULL DEFAULT 100,
+            max_amount DECIMAL(18,4) NOT NULL DEFAULT 50000,
+            sort_order INT NOT NULL DEFAULT 0,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS usdt_methods (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            wallet_name VARCHAR(190) NOT NULL,
+            wallet_address VARCHAR(255) NOT NULL,
+            network VARCHAR(60) NOT NULL DEFAULT 'TRC20',
+            qr_text TEXT NULL,
+            min_amount DECIMAL(18,4) NOT NULL DEFAULT 10,
+            max_amount DECIMAL(18,4) NOT NULL DEFAULT 10000,
+            sort_order INT NOT NULL DEFAULT 0,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS recharge_orders (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            order_no VARCHAR(80) NOT NULL UNIQUE,
+            user_id BIGINT NOT NULL,
+            method_id INT NULL,
+            method_name VARCHAR(190) NULL,
+            amount DECIMAL(18,4) NOT NULL DEFAULT 0,
+            status VARCHAR(30) NOT NULL DEFAULT 'Pending',
+            utr VARCHAR(120) NULL,
+            raw_json LONGTEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS withdraw_orders (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            order_no VARCHAR(80) NOT NULL UNIQUE,
+            user_id BIGINT NOT NULL,
+            withdraw_type VARCHAR(40) NOT NULL DEFAULT 'UPI',
+            amount DECIMAL(18,4) NOT NULL DEFAULT 0,
+            status VARCHAR(30) NOT NULL DEFAULT 'Pending',
+            account_json LONGTEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS user_control (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            win_rate_percent INT NOT NULL DEFAULT 50,
+            status TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uniq_user_control (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS result_queue (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            game_code VARCHAR(40) NOT NULL,
+            issue_number VARCHAR(60) NOT NULL,
+            premium VARCHAR(60) NOT NULL,
+            status VARCHAR(30) NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS gift_codes (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            code VARCHAR(80) NOT NULL UNIQUE,
+            prize_amount DECIMAL(18,4) NOT NULL DEFAULT 0,
+            max_redeem INT NOT NULL DEFAULT 1,
+            redeemed_count INT NOT NULL DEFAULT 0,
+            expired_at TIMESTAMP NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS gift_code_redemptions (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            code VARCHAR(80) NOT NULL,
+            gift_code_id INT NOT NULL DEFAULT 0,
+            user_id BIGINT NOT NULL,
+            amount DECIMAL(18,4) NOT NULL DEFAULT 0,
+            balance_after DECIMAL(18,4) NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS support_tickets (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            title VARCHAR(255) NOT NULL,
+            status VARCHAR(30) NOT NULL DEFAULT 'open',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS ticket_replies (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            ticket_id INT NOT NULL,
+            sender_type VARCHAR(20) NOT NULL,
+            sender_id BIGINT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS work_order_types (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            category VARCHAR(60) NOT NULL UNIQUE,
+            type_id INT NOT NULL DEFAULT 0,
+            display_name VARCHAR(190) NOT NULL,
+            description TEXT NULL,
+            icon VARCHAR(255) NULL,
+            sort INT NOT NULL DEFAULT 100,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS schema_meta (
+            meta_key VARCHAR(80) NOT NULL PRIMARY KEY,
+            meta_value TEXT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS admin_login_history (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            admin_id INT NOT NULL DEFAULT 0,
+            ip_address VARCHAR(80) NULL,
+            user_agent TEXT NULL,
+            status VARCHAR(190) NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS admin_activity_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            admin_id INT NOT NULL DEFAULT 0,
+            action VARCHAR(120) NOT NULL,
+            target VARCHAR(190) NULL,
+            before_state LONGTEXT NULL,
+            after_state LONGTEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    } else {
+        $ddl[] = "CREATE TABLE IF NOT EXISTS api_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            nickname TEXT NULL,
+            phone TEXT NULL,
+            wallet_balance REAL NOT NULL DEFAULT 0,
+            game_balance REAL NOT NULL DEFAULT 0,
+            can_bet INTEGER NOT NULL DEFAULT 1,
+            password TEXT NULL,
+            token TEXT NULL,
+            token_expire INTEGER NULL,
+            referrer_id INTEGER NULL,
+            status INTEGER NOT NULL DEFAULT 1,
+            vipLevel INTEGER NOT NULL DEFAULT 0,
+            raw_json TEXT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS wallet_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            amount REAL NOT NULL,
+            balance_before REAL NOT NULL,
+            balance_after REAL NOT NULL,
+            notes TEXT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS payment_methods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            method_name TEXT NOT NULL,
+            method_type TEXT NOT NULL DEFAULT 'UPI',
+            account_name TEXT NULL,
+            account_value TEXT NULL,
+            qr_text TEXT NULL,
+            min_amount REAL NOT NULL DEFAULT 100,
+            max_amount REAL NOT NULL DEFAULT 50000,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS usdt_methods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet_name TEXT NOT NULL,
+            wallet_address TEXT NOT NULL,
+            network TEXT NOT NULL DEFAULT 'TRC20',
+            qr_text TEXT NULL,
+            min_amount REAL NOT NULL DEFAULT 10,
+            max_amount REAL NOT NULL DEFAULT 10000,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS recharge_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_no TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            method_id INTEGER NULL,
+            method_name TEXT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            utr TEXT NULL,
+            raw_json TEXT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS withdraw_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_no TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            withdraw_type TEXT NOT NULL DEFAULT 'UPI',
+            amount REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            account_json TEXT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS user_control (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE,
+            win_rate_percent INTEGER NOT NULL DEFAULT 50,
+            status INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS result_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_code TEXT NOT NULL,
+            issue_number TEXT NOT NULL,
+            premium TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS gift_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            prize_amount REAL NOT NULL DEFAULT 0,
+            max_redeem INTEGER NOT NULL DEFAULT 1,
+            redeemed_count INTEGER NOT NULL DEFAULT 0,
+            expired_at TEXT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS gift_code_redemptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            gift_code_id INTEGER NOT NULL DEFAULT 0,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            balance_after REAL NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS support_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS ticket_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            sender_type TEXT NOT NULL,
+            sender_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS work_order_types (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL UNIQUE,
+            type_id INTEGER NOT NULL DEFAULT 0,
+            display_name TEXT NOT NULL,
+            description TEXT NULL,
+            icon TEXT NULL,
+            sort INTEGER NOT NULL DEFAULT 100,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS schema_meta (
+            meta_key TEXT NOT NULL PRIMARY KEY,
+            meta_value TEXT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS admin_login_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL DEFAULT 0,
+            ip_address TEXT NULL,
+            user_agent TEXT NULL,
+            status TEXT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS admin_activity_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL DEFAULT 0,
+            action TEXT NOT NULL,
+            target TEXT NULL,
+            before_state TEXT NULL,
+            after_state TEXT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )";
+    }
+
+    foreach ($ddl as $statement) {
+        try {
+            $pdo->exec($statement);
+        } catch (Throwable $e) {
+            // A single broken statement must not stop the rest of the repair.
+        }
+    }
+
+    // Columns added after the first release (safe to call repeatedly)
+    api_ensure_runtime_columns($pdo);
+}
+
 function api_ensure_schema(PDO $pdo): void
 {
     static $done = [];
@@ -208,6 +876,7 @@ function api_ensure_schema(PDO $pdo): void
     }
     $done[$key] = true;
 
+    $marker = api_storage_dir() . '/.schema_v2';
     $driver = api_db_driver($pdo);
     // Ensure essential admin & permission tables exist regardless of whether api_users existed
     try {
@@ -280,14 +949,113 @@ function api_ensure_schema(PDO $pdo): void
         }
     } catch (Throwable $e) {}
 
-    // Check if base schema is already loaded
+    // Safety net for databases that already existed before a feature was added:
+    // the fast check further down can pass while tables like gift_codes,
+    // support_tickets or the admin_* set are still missing. Runs once per
+    // deployment (the marker file is bumped to "2c" afterwards).
     try {
-        $pdo->query("SELECT 1 FROM api_users LIMIT 1");
-        return;
+        $markerValue = is_file($marker) ? trim((string) @file_get_contents($marker)) : '';
+        if ($markerValue !== '2c') {
+            api_self_heal_core_schema($pdo, $driver);
+        }
     } catch (Throwable $e) {
-        // Base tables do not exist, proceed to create full tables below
     }
 
+    // --- Repair tables/columns that older installs are missing -------------
+    // Every balance change writes wallet_logs, and registration needs the
+    // referrer_id/status columns, so they are created even when api_users
+    // already exists (the check below used to skip all of this and from then on
+    // every balance update failed with "no such table: wallet_logs").
+    try {
+        if ($driver === 'mysql') {
+            $pdo->exec("CREATE TABLE IF NOT EXISTS wallet_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                type VARCHAR(50) NOT NULL,
+                amount DECIMAL(18,4) NOT NULL,
+                balance_before DECIMAL(18,4) NOT NULL,
+                balance_after DECIMAL(18,4) NOT NULL,
+                notes TEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+            $pdo->exec("CREATE TABLE IF NOT EXISTS agent_commissions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                from_user_id BIGINT NOT NULL,
+                bet_order_no VARCHAR(80) NOT NULL,
+                commission_level INT NOT NULL,
+                bet_amount DECIMAL(18,4) NOT NULL,
+                commission_amount DECIMAL(18,4) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        } else {
+            $pdo->exec("CREATE TABLE IF NOT EXISTS wallet_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                balance_before REAL NOT NULL,
+                balance_after REAL NOT NULL,
+                notes TEXT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )");
+
+            $pdo->exec("CREATE TABLE IF NOT EXISTS agent_commissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                from_user_id INTEGER NOT NULL,
+                bet_order_no TEXT NOT NULL,
+                commission_level INTEGER NOT NULL,
+                bet_amount REAL NOT NULL,
+                commission_amount REAL NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )");
+        }
+    } catch (Throwable $e) {
+    }
+
+    api_ensure_columns($pdo, 'api_users', [
+        'password' => ['mysql' => 'VARCHAR(255) NULL', 'sqlite' => 'TEXT NULL'],
+        'token' => ['mysql' => 'VARCHAR(255) NULL', 'sqlite' => 'TEXT NULL'],
+        'token_expire' => ['mysql' => 'BIGINT NULL', 'sqlite' => 'INTEGER NULL'],
+        'referrer_id' => ['mysql' => 'BIGINT NULL', 'sqlite' => 'INTEGER NULL'],
+        'status' => ['mysql' => 'TINYINT(1) NOT NULL DEFAULT 1', 'sqlite' => 'INTEGER NOT NULL DEFAULT 1'],
+        'vipLevel' => ['mysql' => 'INT NOT NULL DEFAULT 0', 'sqlite' => 'INTEGER NOT NULL DEFAULT 0'],
+    ]);
+
+    // Columns that were added to older tables after the first release. This has
+    // to run for existing databases too, otherwise withdraw approve/reject and
+    // the demo/agent flags fail with "no such column".
+    api_ensure_runtime_columns($pdo);
+
+    // Check if the whole schema is already loaded. api_users alone is not
+    // enough: older installs are missing wallet_logs, the admin_* tables and
+    // several feature tables, and every statement below is CREATE ... IF NOT
+    // EXISTS so it only adds what is really missing.
+    try {
+        $requiredTables = [
+            'api_users', 'wallet_logs', 'user_control', 'payment_methods', 'usdt_methods',
+            'recharge_orders', 'withdraw_orders', 'gift_codes', 'support_tickets', 'ticket_replies',
+            'result_queue', 'admin_users', 'admin_roles', 'admin_permissions', 'role_permissions',
+            'admin_user_permissions', 'admin_login_history', 'admin_activity_logs',
+            // Added in the admin-panel release: a database that is missing one
+            // of these must fall through to the repair path below even when the
+            // schema marker file already looks current.
+            'gift_code_redemptions', 'work_order_types', 'agent_commissions', 'schema_meta',
+        ];
+        foreach ($requiredTables as $requiredTable) {
+            $pdo->query("SELECT 1 FROM " . $requiredTable . " LIMIT 1");
+        }
+        api_set_default_settings($pdo);
+        api_wallet_migrate_balances($pdo);
+        @file_put_contents($marker, '2c');
+        return;
+    } catch (Throwable $e) {
+        // Some tables are missing: create them below
+    }
+
+    try {
     $driver = api_db_driver($pdo);
     if ($driver === 'mysql') {
         $pdo->exec("CREATE TABLE IF NOT EXISTS api_responses (
@@ -309,7 +1077,7 @@ function api_ensure_schema(PDO $pdo): void
             nickname VARCHAR(120) NOT NULL,
             phone VARCHAR(60) NULL,
             wallet_balance DECIMAL(18,4) NOT NULL DEFAULT 0,
-            game_balance DECIMAL(18,4) NOT NULL DEFAULT 4.45,
+            game_balance DECIMAL(18,4) NOT NULL DEFAULT 0,
             can_bet TINYINT(1) NOT NULL DEFAULT 1,
             password VARCHAR(255) NULL,
             token VARCHAR(255) NULL,
@@ -469,7 +1237,7 @@ function api_ensure_schema(PDO $pdo): void
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
-        $stmt = $pdo->prepare("INSERT IGNORE INTO api_users (user_id, username, nickname, phone, wallet_balance, game_balance, can_bet) VALUES (132257, 'local_member', 'MemberNNGKLPHA', '919119098026', 0, 4.45, 1)");
+        $stmt = $pdo->prepare("INSERT IGNORE INTO api_users (user_id, username, nickname, phone, wallet_balance, game_balance, can_bet) VALUES (132257, 'local_member', 'MemberNNGKLPHA', '919119098026', 0, 0, 1)");
         $stmt->execute();
         $stmt = $pdo->prepare("INSERT IGNORE INTO payment_methods (id, method_name, method_type, account_name, account_value, qr_text, min_amount, max_amount, sort_order, enabled) VALUES (400101, 'PhonePe', 'UPI', 'Dhani Win', 'rajputajay22266-1@oksbi', 'upi://pay?pa=rajputajay22266-1@oksbi&pn=Dhani%20Win&cu=INR', 100, 50000, 10, 1)");
         $stmt->execute();
@@ -605,6 +1373,34 @@ function api_ensure_schema(PDO $pdo): void
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
+        $pdo->exec("CREATE TABLE IF NOT EXISTS gift_code_redemptions (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            code VARCHAR(80) NOT NULL,
+            gift_code_id INT NOT NULL DEFAULT 0,
+            user_id BIGINT NOT NULL,
+            amount DECIMAL(18,4) NOT NULL DEFAULT 0,
+            balance_after DECIMAL(18,4) NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS work_order_types (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            category VARCHAR(60) NOT NULL UNIQUE,
+            type_id INT NOT NULL DEFAULT 0,
+            display_name VARCHAR(190) NOT NULL,
+            description TEXT NULL,
+            icon VARCHAR(255) NULL,
+            sort INT NOT NULL DEFAULT 100,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS schema_meta (
+            meta_key VARCHAR(80) NOT NULL PRIMARY KEY,
+            meta_value TEXT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
         $pdo->exec("CREATE TABLE IF NOT EXISTS support_tickets (
             id INT AUTO_INCREMENT PRIMARY KEY,
             user_id BIGINT NOT NULL,
@@ -642,7 +1438,7 @@ function api_ensure_schema(PDO $pdo): void
             nickname TEXT NOT NULL,
             phone TEXT NULL,
             wallet_balance REAL NOT NULL DEFAULT 0,
-            game_balance REAL NOT NULL DEFAULT 4.45,
+            game_balance REAL NOT NULL DEFAULT 0,
             can_bet INTEGER NOT NULL DEFAULT 1,
             password TEXT NULL,
             token TEXT NULL,
@@ -806,7 +1602,7 @@ function api_ensure_schema(PDO $pdo): void
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )");
 
-        $stmt = $pdo->prepare("INSERT OR IGNORE INTO api_users (user_id, username, nickname, phone, wallet_balance, game_balance, can_bet) VALUES (132257, 'local_member', 'MemberNNGKLPHA', '919119098026', 0, 4.45, 1)");
+        $stmt = $pdo->prepare("INSERT OR IGNORE INTO api_users (user_id, username, nickname, phone, wallet_balance, game_balance, can_bet) VALUES (132257, 'local_member', 'MemberNNGKLPHA', '919119098026', 0, 0, 1)");
         $stmt->execute();
         $stmt = $pdo->prepare("INSERT OR IGNORE INTO payment_methods (id, method_name, method_type, account_name, account_value, qr_text, min_amount, max_amount, sort_order, enabled) VALUES (400101, 'PhonePe', 'UPI', 'Dhani Win', 'rajputajay22266-1@oksbi', 'upi://pay?pa=rajputajay22266-1@oksbi&pn=Dhani%20Win&cu=INR', 100, 50000, 10, 1)");
         $stmt->execute();
@@ -942,6 +1738,34 @@ function api_ensure_schema(PDO $pdo): void
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )");
 
+        $pdo->exec("CREATE TABLE IF NOT EXISTS gift_code_redemptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            gift_code_id INTEGER NOT NULL DEFAULT 0,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            balance_after REAL NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS work_order_types (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL UNIQUE,
+            type_id INTEGER NOT NULL DEFAULT 0,
+            display_name TEXT NOT NULL,
+            description TEXT NULL,
+            icon TEXT NULL,
+            sort INTEGER NOT NULL DEFAULT 100,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS schema_meta (
+            meta_key TEXT NOT NULL PRIMARY KEY,
+            meta_value TEXT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )");
+
         $pdo->exec("CREATE TABLE IF NOT EXISTS support_tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -959,6 +1783,11 @@ function api_ensure_schema(PDO $pdo): void
             message TEXT NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )");
+    }
+
+    } catch (Throwable $e) {
+        // One statement failed on a partially created database: keep the site
+        // running, the next request retries the still missing pieces.
     }
 
     api_set_default_settings($pdo);
@@ -1064,14 +1893,53 @@ function api_ensure_schema(PDO $pdo): void
         }
     } catch (Throwable $e) {}
 
-    @file_put_contents($marker, '1');
+    // Tables were just created: add the post-release columns as well, otherwise
+    // the first admin action on a brand new database fails with
+    // "table api_users has no column named is_demo".
+    api_ensure_runtime_columns($pdo, true);
+
+    api_wallet_migrate_balances($pdo);
+    @file_put_contents($marker, '2c');
     $done[$key] = true;
 }
 
 function api_set_default_settings(PDO $pdo): void
 {
+    // Repair the settings row that the old build seeded with a free balance.
+    try {
+        $pdo->prepare("UPDATE api_settings SET setting_value = '0', updated_at = CURRENT_TIMESTAMP WHERE setting_key IN ('default_game_balance', 'default_wallet_balance') AND setting_value IN ('4.45', '4,45')")
+            ->execute();
+    } catch (Throwable $e) {
+    }
+
+    // The old build seeded `amount_coding = 4.11` and gated every withdrawal on
+    // it. It is not a real wager requirement, so it is zeroed here and the
+    // setting the apps really read is seeded with "nothing required".
+    try {
+        $pdo->prepare("UPDATE api_settings SET setting_value = '0', updated_at = CURRENT_TIMESTAMP WHERE setting_key = 'amount_coding' AND setting_value <> '0'")
+            ->execute();
+    } catch (Throwable $e) {
+    }
+
+    // Saved reference responses for the money / admin screens are switched off
+    // for good so no code path can answer a balance from the old snapshot.
+    if (api_setting('money_snapshots_disabled', '') !== '1') {
+        try {
+            $live = api_live_endpoints();
+            if ($live) {
+                $placeholders = implode(',', array_fill(0, count($live), '?'));
+                $pdo->prepare("UPDATE api_responses SET enabled = 0 WHERE LOWER(endpoint) IN (" . $placeholders . ")")
+                    ->execute($live);
+            }
+            $pdo->prepare("INSERT INTO api_settings (setting_key, setting_value) VALUES ('money_snapshots_disabled', '1')")
+                ->execute();
+        } catch (Throwable $e) {
+        }
+    }
+
     $defaults = [
         'site_status' => 'online',
+
         'login_enabled' => '1',
         'register_enabled' => '1',
         'bet_enabled' => '1',
@@ -1086,7 +1954,6 @@ function api_set_default_settings(PDO $pdo): void
         'upi_display_name' => 'Dhani Win',
         'upi_id' => 'rajputajay22266-1@oksbi',
         'support_url' => '/workOrder',
-        'amount_coding' => '4.11',
         'first_recharge_bonus_enabled' => '1',
         'first_recharge_bonus_percent' => '10',
         'first_recharge_bonus_max' => '500',
@@ -1106,7 +1973,12 @@ function api_set_default_settings(PDO $pdo): void
         'home_popup_title' => 'free 500',
         'home_popup_image' => '/img/6006/other/111109657-38344-file_20260510111109590.webp',
         'default_wallet_balance' => '0',
-        'default_game_balance' => '4.45',
+        // Wager required before a withdrawal is allowed (0 = nothing blocks it).
+        'wager_required_amount' => '0',
+        // Old installs shipped with a 4.45 "welcome" balance; registration no
+        // longer reads this, but the value is cleaned up so the Settings page
+        // shows the real rule (a new member starts at zero).
+        'default_game_balance' => '0',
         'wheel_allow_daily_extra_spin' => '1',
     ];
     $driver = api_db_driver($pdo);
@@ -1370,8 +2242,62 @@ function api_read_snapshot_payload(string $endpoint): ?array
     return $payload;
 }
 
+/**
+ * Endpoints that must always answer from the database.
+ *
+ * The site keeps the reference responses that came with the original dump in
+ * `api_responses`, and the original build also hard-coded those same numbers in
+ * the endpoint files. A saved balance snapshot must never win over the live
+ * value: it is what made the deposit page show "4" (PlatForm 4.45) and the
+ * profile show nothing while the wallet really held the player's money.
+ * The router and api_get_override() both read this one list.
+ */
+function api_live_endpoints(): array
+{
+    return [
+        'user/getuserinfo',
+        'user/getuserfinanciallist',
+        'home/checkcanbet',
+        'thirdgame/getargamebalance',
+        'thirdgame/getargameandplatwallets',
+        'thirdgame/recoversaasbalance',
+        'thirdgame/notifyargamerecover',
+        'thirdgame/transfer',
+        'lottery/getbalance',
+        'lottery/getuserinfo',
+        'recharge/getrechargebasicinfo',
+        'recharge/getrechargecategorylist',
+        'recharge/getrechargerecord',
+        'recharge/getrechargerecordpage',
+        'withdraw/getwithdrawbasicinfo',
+        'withdraw/getarbwalletinfo',
+        'withdraw/getwithdrawhistory',
+        'withdraw/getwithdrawrecordpage',
+        'withdraw/getuserwithdrawwallet',
+        // Admin panel features that must never be answered from a saved snapshot:
+        // gift codes (create -> claim), support tickets and the work-order forms.
+        'activity/receiveredenvelope',
+        'activity/getuserredenveloperecordpagelist',
+        'activity/getpagelistuserredenveloperecord',
+        'support/getticketlist',
+        'workorder/getformlist',
+        'workorder/getformfieldlist',
+        'workorder/getpagelist',
+        'workorder/getcommentlist',
+    ];
+}
+
 function api_get_override(string $endpoint): ?array
 {
+    $endpoint = api_normalize_endpoint($endpoint);
+    // Balance / wallet / admin endpoints always come from the database. Without
+    // this the original endpoint files answered from the saved snapshot (the
+    // deposit page showed the old "4.45" wallet for every player).
+    if (in_array(strtolower($endpoint), api_live_endpoints(), true)) {
+        return null;
+    }
+    $pdo = api_pdo();
+
     $endpoint = api_normalize_endpoint($endpoint);
     $pdo = api_pdo();
     if ($pdo) {
@@ -1506,65 +2432,124 @@ function api_list_snapshot_endpoints(): array
     return $endpoints;
 }
 
-function api_primary_user(): array
+/**
+ * The bearer token this request carries. "Bearer undefined" (clients whose
+ * localStorage had no token) and empty values count as "no token at all".
+ */
+function api_request_token(): string
+{
+    $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+    if ($authHeader === '' && function_exists('apache_request_headers')) {
+        $headers = apache_request_headers();
+        if (is_array($headers)) {
+            $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+        }
+    }
+    if ($authHeader === '' && function_exists('getallheaders')) {
+        $headers = getallheaders();
+        if (is_array($headers)) {
+            $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+        }
+    }
+    $token = '';
+    if (is_string($authHeader) && $authHeader !== '' && preg_match('/Bearer\s+(.+)$/i', $authHeader, $matches)) {
+        $token = trim($matches[1]);
+    }
+    if ($token === '') {
+        $value = $_REQUEST['token'] ?? $_GET['token'] ?? $_POST['token'] ?? $_COOKIE['ar_token'] ?? '';
+        $token = is_string($value) ? trim($value) : '';
+    }
+    if (strtolower($token) === 'undefined' || strtolower($token) === 'null') {
+        return '';
+    }
+    return $token;
+}
+
+/**
+ * The player this request is logged in as - resolved from its own token only,
+ * never from "some other" row. Returns null for guests, dead tokens and
+ * "Bearer undefined" clients so money endpoints can answer zero / ask to login
+ * instead of showing another account's wallet.
+ */
+function api_session_user(bool $fresh = false): ?array
+{
+    static $sessionUser = null;
+    static $resolved = false;
+    if ($fresh) {
+        $sessionUser = null;
+        $resolved = false;
+    }
+    if ($resolved) {
+        return $sessionUser;
+    }
+    $resolved = true;
+
+    $token = api_request_token();
+    if ($token === '') {
+        return null;
+    }
+    $pdo = api_pdo();
+    if (!$pdo) {
+        return null;
+    }
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM api_users WHERE token = ? LIMIT 1");
+        $stmt->execute([$token]);
+        $user = $stmt->fetch();
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!$user) {
+        return null;
+    }
+    $sessionUser = $user;
+    return $user;
+}
+
+/** True when the request really is a logged-in player. */
+function api_has_session(): bool
+{
+    return api_session_user() !== null;
+}
+
+/** Zero-balance stand-in for requests without a session. Never a real row. */
+function api_guest_user(): array
+{
+    return [
+        'id' => 0,
+        'user_id' => 0,
+        'username' => 'guest',
+        'nickname' => 'Guest',
+        'phone' => '',
+        'wallet_balance' => 0,
+        'game_balance' => 0,
+        'status' => 1,
+        'can_bet' => 0,
+        'vipLevel' => 0,
+        'token' => '',
+        'token_expire' => 0,
+    ];
+}
+
+function api_primary_user(bool $fresh = false): array
 {
     static $currentUser = null;
+    if ($fresh) {
+        // Force a re-read: after a wallet / profile change inside the same
+        // request (admin action, deposit approval, gift claim) the cached row
+        // would otherwise still show the old balance.
+        $currentUser = null;
+        api_session_user(true);
+    }
     if ($currentUser !== null) {
         return $currentUser;
     }
 
-    $token = '';
-    // Check Authorization header
-    $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
-    if (empty($authHeader) && function_exists('getallheaders')) {
-        $headers = getallheaders();
-        $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
-    }
-    if (!empty($authHeader) && preg_match('/Bearer\s+(.+)$/i', $authHeader, $matches)) {
-        $token = trim($matches[1]);
-    }
-    
-    // Fallback: check query, body, or cookies
-    if ($token === '') {
-        $token = $_REQUEST['token'] ?? $_GET['token'] ?? $_POST['token'] ?? '';
-    }
-
-    $pdo = api_pdo();
-    if ($pdo && !empty($token)) {
-        try {
-            $stmt = $pdo->prepare("SELECT * FROM api_users WHERE token = ? LIMIT 1");
-            $stmt->execute([$token]);
-            $user = $stmt->fetch();
-            if ($user) {
-                $currentUser = $user;
-                return $user;
-            }
-        } catch (Throwable $e) {
-        }
-    }
-
-    // If no user matched, return the first user as a fallback (so public routes/tests still work)
-    if ($pdo) {
-        try {
-            $row = $pdo->query("SELECT * FROM api_users ORDER BY id LIMIT 1")->fetch();
-            if ($row) {
-                $currentUser = $row;
-                return $row;
-            }
-        } catch (Throwable $e) {
-        }
-    }
-
-    return [
-        'id' => 1,
-        'user_id' => 132257,
-        'username' => 'local_member',
-        'nickname' => 'MemberNNGKLPHA',
-        'phone' => '919119098026',
-        'wallet_balance' => 0,
-        'game_balance' => 4.45,
-        'can_bet' => 1,
-    ];
+    // Only the request's own token counts. The old "first row of api_users"
+    // fallback showed one account's balance on every screen that had no valid
+    // session (and let anonymous requests write to that account), so it is gone.
+    $currentUser = api_session_user() ?: api_guest_user();
+    return $currentUser;
 }
 
 // api_client_ip robust implementation is declared above
@@ -1632,7 +2617,7 @@ function api_user_register(array $input): array
     ], JSON_UNESCAPED_SLASHES);
 
     try {
-        $stmt = $pdo->prepare("INSERT INTO api_users (user_id, username, nickname, phone, wallet_balance, game_balance, can_bet, password, token, token_expire, referrer_id, raw_json) VALUES (?, ?, ?, ?, 0.0, 4.45, 1, ?, ?, ?, ?, ?)");
+        $stmt = $pdo->prepare("INSERT INTO api_users (user_id, username, nickname, phone, wallet_balance, game_balance, can_bet, password, token, token_expire, referrer_id, raw_json) VALUES (?, ?, ?, ?, 0.0, 0.0, 1, ?, ?, ?, ?, ?)");
         $stmt->execute([$userId, $username, $nickname, $username, $password, $token, $tokenExpire, $referrerId, $rawJson]);
     } catch (Throwable $e) {
         return api_error('Registration failed: ' . $e->getMessage(), 500);
@@ -1683,6 +2668,12 @@ function api_user_login(array $input): array
         return api_error('Invalid password', 401);
     }
 
+    // Banned members (admin panel -> Banned Users) must not be able to log in.
+    if ((int) ($user['status'] ?? 1) === 0) {
+        $reason = trim((string) ($user['ban_reason'] ?? ''));
+        return api_error('This account has been blocked by the administrator' . ($reason !== '' ? ': ' . $reason : ''), 403, 116);
+    }
+
     $token = 'local_' . sha1((string) $username . microtime(true));
     $tokenExpire = api_now_ms() + 604800000;
 
@@ -1727,18 +2718,20 @@ function api_user_login(array $input): array
 
 function api_user_autologin(array $input): array
 {
-    $user = api_primary_user();
-    $token = '';
-    $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
-    if (empty($authHeader) && function_exists('getallheaders')) {
-        $headers = getallheaders();
-        $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+    // AutoLogin / RefreshToken only continue a session that still exists.
+    // Handing a fresh token to a dead one left clients "logged in" as nobody.
+    $session = api_session_user(true);
+    if (!$session) {
+        return api_error('Please login again', 401, -1);
     }
-    if (!empty($authHeader) && preg_match('/Bearer\s+(.+)$/i', $authHeader, $matches)) {
-        $token = trim($matches[1]);
+    $user = $session;
+
+    if ((int) ($user['status'] ?? 1) === 0) {
+        return api_error('This account has been blocked by the administrator', 403, 116);
     }
+    $token = api_request_token();
     if ($token === '') {
-        $token = $_REQUEST['token'] ?? $_GET['token'] ?? $_POST['token'] ?? $user['token'] ?? '';
+        $token = (string) ($user['token'] ?? '');
     }
 
     $tokenExpire = isset($user['token_expire']) ? (int) $user['token_expire'] : (api_now_ms() + 604800000);
@@ -1768,7 +2761,7 @@ function api_user_info_data(): array
         'isOpenVip' => true,
         'vipLevel' => 0,
         'rechargeLevel' => 2,
-        'walletBalance' => (float) $user['wallet_balance'],
+        'walletBalance' => api_wallet_balance_of($user),
         'safeBoxAmount' => 0.0,
         'boolAttr' => 164865,
         'hasNoReadMessage' => false,
@@ -2779,16 +3772,19 @@ function api_lottery_current_balance(int $userDbId): float
 {
     $pdo = api_pdo();
     if (!$pdo) {
-        return (float) api_primary_user()['game_balance'];
+        return api_wallet_balance_of(api_primary_user());
     }
-    $stmt = $pdo->prepare("SELECT game_balance FROM api_users WHERE id = ? LIMIT 1");
+    $stmt = $pdo->prepare("SELECT wallet_balance, game_balance FROM api_users WHERE id = ? LIMIT 1");
     $stmt->execute([$userDbId]);
-    $value = $stmt->fetchColumn();
-    return $value === false ? 0.0 : (float) $value;
+    $row = $stmt->fetch();
+    return $row ? api_wallet_balance_of($row) : 0.0;
 }
 
 function api_lottery_place_bet(string $endpoint, array $input): array
 {
+    if (!api_has_session()) {
+        return api_error('Please login to place a bet', 401, -1);
+    }
     $pdo = api_pdo();
     $user = api_primary_user();
     $gameCode = api_lottery_game_from_input($input, $endpoint);
@@ -2811,15 +3807,16 @@ function api_lottery_place_bet(string $endpoint, array $input): array
     if (!$pdo) {
         return api_error('Database is not available', 315, -1);
     }
-    if ((float) $user['game_balance'] < $stake) {
-        return api_error('Insufficient balance', 142, -1, ['balance' => (float) $user['game_balance']]);
+    $available = api_wallet_balance_of($user);
+    if ($available < $stake) {
+        return api_error('Insufficient balance', 142, -1, ['balance' => $available]);
     }
 
     $orderNo = 'LOT' . date('YmdHis') . mt_rand(1000, 9999);
     try {
         $pdo->beginTransaction();
-        $stmt = $pdo->prepare("UPDATE api_users SET game_balance = game_balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND game_balance >= ?");
-        $stmt->execute([$stake, $user['id'], $stake]);
+        $stmt = $pdo->prepare("UPDATE api_users SET game_balance = game_balance - ?, wallet_balance = wallet_balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND game_balance >= ?");
+        $stmt->execute([$stake, $stake, $user['id'], $stake]);
         if ($stmt->rowCount() < 1) {
             $pdo->rollBack();
             return api_error('Insufficient balance', 142, -1, ['balance' => api_lottery_current_balance((int) $user['id'])]);
@@ -2942,8 +3939,8 @@ function api_lottery_settle_bet(array $bet): array
     try {
         $pdo->beginTransaction();
         if ($winAmount > 0) {
-            $stmt = $pdo->prepare("UPDATE api_users SET game_balance = game_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-            $stmt->execute([$winAmount, $bet['user_id']]);
+            $stmt = $pdo->prepare("UPDATE api_users SET game_balance = game_balance + ?, wallet_balance = wallet_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+            $stmt->execute([$winAmount, $winAmount, $bet['user_id']]);
         }
         $stmt = $pdo->prepare("UPDATE lottery_bets SET status = ?, result_premium = ?, win_amount = ?, profit_amount = ?, settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'");
         $stmt->execute([$status, $result['premium'], $winAmount, $profit, $bet['id']]);
@@ -3143,9 +4140,16 @@ function api_lottery_dynamic(string $endpoint, array $input): ?array
         return api_lottery_success(api_lottery_rates($gameCode));
     }
     if ($action === 'getbalance') {
-        return api_lottery_success(['balance' => (float) api_primary_user()['game_balance']]);
+        // Same single wallet the site header and the profile read.
+        return api_lottery_success([
+            'balance' => api_wallet_balance_of(api_primary_user()),
+            'currency' => (string) (api_config()['site']['currency'] ?? 'INR'),
+        ]);
     }
     if ($action === 'getuserinfo') {
+        if (!api_has_session()) {
+            return api_error('Please login', 401, -1);
+        }
         return api_success(api_user_info_data());
     }
     if ($action === 'getgamelist') {
@@ -3267,6 +4271,18 @@ function api_recharge_front_type(string $methodType): string
     return $type !== '' ? $type : 'LocalUPI';
 }
 
+/** Icon shown on the deposit page: the admin uploaded image wins. */
+function api_gateway_icon_url(array $method): string
+{
+    foreach (['icon_url', 'qr_image'] as $key) {
+        $value = trim((string) ($method[$key] ?? ''));
+        if ($value !== '') {
+            return $value;
+        }
+    }
+    return '/assets/icons/icon-192.png';
+}
+
 function api_recharge_category_payload(): array
 {
     $rows = [];
@@ -3279,8 +4295,8 @@ function api_recharge_category_payload(): array
             'rechargeType' => api_recharge_front_type((string) ($method['method_type'] ?? 'UPI')),
             'state' => !empty($method['enabled']) ? 1 : 0,
             'sort' => (int) ($method['sort_order'] ?? 0),
-            'iconUrl' => '/assets/icons/icon-192.png',
-            'selectedIconUrl' => '/assets/icons/icon-192.png',
+            'iconUrl' => api_gateway_icon_url($method),
+            'selectedIconUrl' => api_gateway_icon_url($method),
             'rate' => 1.0,
             'minAmount' => $min,
             'maxAmount' => $max,
@@ -3297,18 +4313,37 @@ function api_recharge_category_payload(): array
     return api_success($rows);
 }
 
+/**
+ * The "wager required before withdrawal" number the apps read as amountCoding.
+ *
+ * The original build hard-coded 4.11 here and also seeded that value into the
+ * settings table. Every game screen gates on it: while it is greater than zero
+ * the app shows "Withdrawable 0" and refuses to submit a withdrawal, so every
+ * player saw a locked wallet and "Wager Required to Withdraw: 4.11".
+ * This site does not run a wagering requirement: the number now comes from the
+ * `wager_required_amount` setting and stays 0 unless the admin asks for one.
+ */
+function api_amount_coding(): float
+{
+    $value = api_setting_float('wager_required_amount', 0.0);
+    return $value > 0 ? round($value, 4) : 0.0;
+}
+
 function api_recharge_basic_info_payload(): array
+
 {
     $user = api_primary_user();
     return api_success([
+        // The deposit page reads the PlatForm row and the header adds such rows
+        // up, so the money sits in exactly one row to avoid showing it twice.
         'gameSaasBalance' => [
-            ['vendorCode' => 'ARGame', 'balance' => (float) $user['game_balance'], 'currency' => 'INR', 'tenantId' => (int) (api_config()['site']['tenant_id'] ?? 6006), 'userId' => (int) $user['user_id']],
-            ['vendorCode' => 'PlatForm', 'balance' => (float) $user['wallet_balance'], 'currency' => 'INR', 'tenantId' => (int) (api_config()['site']['tenant_id'] ?? 6006), 'userId' => (int) $user['user_id']],
+            ['vendorCode' => 'ARGame', 'balance' => 0.0, 'currency' => 'INR', 'tenantId' => (int) (api_config()['site']['tenant_id'] ?? 6006), 'userId' => (int) $user['user_id']],
+            ['vendorCode' => 'PlatForm', 'balance' => api_wallet_balance_of($user), 'currency' => 'INR', 'tenantId' => (int) (api_config()['site']['tenant_id'] ?? 6006), 'userId' => (int) $user['user_id']],
         ],
         'goodsList' => [],
         'advisementList' => [],
         'onGoingOrder' => null,
-        'amountCoding' => api_setting_float('amount_coding', 4.11),
+        'amountCoding' => api_amount_coding(),
         'classicBonusDetails' => null,
     ]);
 }
@@ -3376,6 +4411,9 @@ function api_recharge_to_pay_payload(array $input): array
 {
     if (!api_setting_bool('recharge_enabled', true)) {
         return api_error('Recharge is disabled', 405, -1);
+    }
+    if (!api_has_session()) {
+        return api_error('Please login to recharge', 401, -1);
     }
     $pdo = api_pdo();
     $user = api_primary_user();
@@ -3663,9 +4701,9 @@ function api_withdraw_basic_info_payload(): array
 {
     $user = api_primary_user();
     return api_success([
-        'balance' => (float) $user['wallet_balance'],
+        'balance' => api_wallet_balance_of($user),
         'realName' => '',
-        'amountCoding' => api_setting_float('amount_coding', 4.11),
+        'amountCoding' => api_amount_coding(),
         'hasWithdrawPassword' => false,
         'withdrawCategoryList' => [
             ['id' => 400080, 'tenantId' => (int) (api_config()['site']['tenant_id'] ?? 6006), 'withdrawType' => 'UPI', 'name' => 'UPI', 'iconUrl' => '/assets/icons/icon-192.png', 'selectedIconUrl' => '/assets/icons/icon-192.png', 'userMaxBindCount' => 1, 'maxWithdrawTimes' => 5, 'minAmount' => 100.0, 'maxAmount' => 50000.0, 'feeAmountRangeMin' => 0.0, 'feeAmountRangeMax' => 0.0, 'feeType' => 0, 'feePercent' => 0.0, 'fee' => 0.0, 'allowStartTime' => '00:00', 'allowEndTime' => '23:59', 'sort' => 150, 'state' => api_setting_bool('withdraw_enabled', true) ? 1 : 0],
@@ -3689,24 +4727,28 @@ function api_withdraw_submit_payload(array $input): array
     if (!api_setting_bool('withdraw_enabled', true)) {
         return api_error('Withdraw is disabled', 405, -1);
     }
+    if (!api_has_session()) {
+        return api_error('Please login to withdraw', 401, -1);
+    }
     $pdo = api_pdo();
     $user = api_primary_user();
     $amount = (float) api_param($input, 'amount', api_param($input, 'withdrawAmount', 0));
     if ($amount <= 0) {
         return api_error('Invalid amount', 401, -1);
     }
-    if ((float) $user['wallet_balance'] < $amount) {
-        return api_error('Insufficient balance', 142, -1, ['balance' => (float) $user['wallet_balance']]);
+    $available = api_wallet_balance_of($user);
+    if ($available < $amount) {
+        return api_error('Insufficient balance', 142, -1, ['balance' => $available]);
     }
     $orderNo = 'WD' . date('YmdHis') . mt_rand(1000, 9999);
     if ($pdo) {
         try {
             $pdo->beginTransaction();
-            $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = wallet_balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND wallet_balance >= ?");
-            $stmt->execute([$amount, $user['id'], $amount]);
+            $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = wallet_balance - ?, game_balance = game_balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND wallet_balance >= ?");
+            $stmt->execute([$amount, $amount, $user['id'], $amount]);
             if ($stmt->rowCount() < 1) {
                 $pdo->rollBack();
-                return api_error('Insufficient balance', 142, -1, ['balance' => (float) $user['wallet_balance']]);
+                return api_error('Insufficient balance', 142, -1, ['balance' => api_wallet_balance_of($user)]);
             }
             $stmt = $pdo->prepare("INSERT INTO withdraw_orders (order_no, user_id, withdraw_type, amount, status, account_json, updated_at) VALUES (?, ?, ?, ?, 'Pending', ?, CURRENT_TIMESTAMP)");
             $stmt->execute([$orderNo, $user['id'], (string) api_param($input, 'withdrawType', 'UPI'), $amount, api_json_value($input['params'] ?? [])]);
@@ -3766,12 +4808,21 @@ function api_withdraw_history_payload(array $input): array
 function api_thirdgame_transfer_payload(array $input, bool $recover = false): array
 {
     $pdo = api_pdo();
-    $user = api_primary_user();
-    if (!$pdo) {
-        return api_success([
-            'walletBalance' => (float) $user['wallet_balance'],
-            'gameBalance' => (float) $user['game_balance'],
-        ]);
+    $currency = (string) (api_config()['site']['currency'] ?? 'INR');
+    $user = api_session_user();
+
+    if (!$user) {
+        // RecoverSaasBalance is polled by the wallet card, so it answers quietly
+        // with an empty wallet; a real Transfer is refused instead.
+        if ($recover) {
+            return api_success([
+                'balance' => 0.0,
+                'walletBalance' => 0.0,
+                'gameBalance' => 0.0,
+                'currency' => $currency,
+            ]);
+        }
+        return api_error('Please login', 401, -1);
     }
 
     $amount = (float) api_param($input, 'amount', api_param($input, 'transferAmount', 0));
@@ -3784,39 +4835,55 @@ function api_thirdgame_transfer_payload(array $input, bool $recover = false): ar
         $toGame = true;
     }
 
-    $wallet = (float) $user['wallet_balance'];
-    $game = (float) $user['game_balance'];
-    if ($amount <= 0) {
-        $amount = $toGame ? $wallet : $game;
+    // Wallet and game now hold the same money, so a transfer no longer moves
+    // funds between two pools - it only re-syncs both columns and reports the
+    // (unchanged) balance. The money itself stays exactly where it was.
+    $balance = api_wallet_balance_of($user);
+    if (!$pdo) {
+        return api_success([
+            'balance' => $balance,
+            'walletBalance' => $balance,
+            'gameBalance' => $balance,
+            'currency' => $currency,
+        ]);
+    }
+    if ($balance <= 0) {
+        return api_success([
+            'balance' => 0.0,
+            'walletBalance' => 0.0,
+            'gameBalance' => 0.0,
+            'amount' => 0.0,
+            'currency' => $currency,
+        ]);
     }
     if ($amount <= 0) {
-        return api_success(['walletBalance' => $wallet, 'gameBalance' => $game]);
+        $amount = $balance;
     }
-    if ($toGame && $wallet < $amount) {
-        return api_error('Insufficient balance', 142, -1, ['walletBalance' => $wallet, 'gameBalance' => $game]);
-    }
-    if (!$toGame && $game < $amount) {
-        return api_error('Insufficient balance', 142, -1, ['walletBalance' => $wallet, 'gameBalance' => $game]);
+    if ($balance < $amount) {
+        return api_error('Insufficient balance', 142, -1, [
+            'balance' => $balance,
+            'walletBalance' => $balance,
+            'gameBalance' => $balance,
+            'currency' => $currency,
+        ]);
     }
 
     try {
-        if ($toGame) {
-            $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = wallet_balance - ?, game_balance = game_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND wallet_balance >= ?");
-            $stmt->execute([$amount, $amount, $user['id'], $amount]);
-        } else {
-            $stmt = $pdo->prepare("UPDATE api_users SET game_balance = game_balance - ?, wallet_balance = wallet_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND game_balance >= ?");
-            $stmt->execute([$amount, $amount, $user['id'], $amount]);
-        }
+        $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = ?, game_balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+        $stmt->execute([$balance, $balance, $user['id']]);
     } catch (Throwable $e) {
         return api_error('Transfer failed', 403, -1);
     }
 
-    $fresh = api_primary_user();
+    $fresh = api_session_user(true);
+    $freshBalance = $fresh ? api_wallet_balance_of($fresh) : $balance;
     api_audit('thirdgame_transfer', $toGame ? 'wallet_to_game' : 'game_to_wallet', ['amount' => $amount]);
     return api_success([
-        'walletBalance' => (float) $fresh['wallet_balance'],
-        'gameBalance' => (float) $fresh['game_balance'],
+        'balance' => $freshBalance,
+        'walletBalance' => $freshBalance,
+        'gameBalance' => $freshBalance,
         'amount' => $amount,
+        'currency' => $currency,
     ]);
 }
 
@@ -3998,7 +5065,7 @@ function api_invited_wheel_info_payload(): array
         'isOpenDiskDisplay' => true,
         'isFirstInvitedWheel' => false,
         'userInvitedWheelCount' => api_wheel_spin_count('invited', (int) $user['id']),
-        'userInvitedWheelAmount' => (float) $user['wallet_balance'],
+        'userInvitedWheelAmount' => api_wallet_balance_of($user),
         'invitedWheelTotalPrizeAmount' => api_setting_float('invited_wheel_total_prize', 500.0),
         'expiredTime' => api_now_ms() + 86400000,
         'diskDisplayAmount' => array_values($display),
@@ -4067,10 +5134,9 @@ function api_wheel_spin_payload(string $wheelType): array
     if ($pdo) {
         try {
             $pdo->beginTransaction();
-            $column = $wheelType === 'recharge' ? 'game_balance' : 'wallet_balance';
             if ($amount > 0) {
-                $stmt = $pdo->prepare("UPDATE api_users SET $column = $column + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-                $stmt->execute([$amount, $user['id']]);
+                $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = wallet_balance + ?, game_balance = game_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+                $stmt->execute([$amount, $amount, $user['id']]);
             }
             $stmt = $pdo->prepare("INSERT INTO wheel_spins (user_id, wheel_type, reward_type, prize_amount, is_win, raw_json) VALUES (?, ?, ?, ?, ?, ?)");
             $stmt->execute([$user['id'], $wheelType, (int) $reward['rewardType'], $amount, $isWin ? 1 : 0, api_json_value($reward)]);
@@ -4139,15 +5205,16 @@ function api_wheel_record_page(string $wheelType, array $input): array
 function api_user_financial_payload(array $input): array
 {
     $user = api_primary_user();
+    $backBalance = api_wallet_balance_of($user);
     $list = [];
     foreach (api_recharge_record_payload($input)['data']['list'] ?? [] as $row) {
-        $list[] = ['id' => $row['orderNo'], 'orderNo' => $row['orderNo'], 'vendorCode' => '', 'type' => 'Recharge', 'subType' => '', 'amount' => (float) $row['amount'], 'backAmount' => (float) $user['wallet_balance'], 'createTime' => $row['createTime'], 'remark' => $row['status']];
+        $list[] = ['id' => $row['orderNo'], 'orderNo' => $row['orderNo'], 'vendorCode' => '', 'type' => 'Recharge', 'subType' => '', 'amount' => (float) $row['amount'], 'backAmount' => $backBalance, 'createTime' => $row['createTime'], 'remark' => $row['status']];
     }
     foreach (api_withdraw_history_payload($input)['data']['list'] ?? [] as $row) {
-        $list[] = ['id' => $row['orderNo'], 'orderNo' => $row['orderNo'], 'vendorCode' => '', 'type' => 'Withdraw', 'subType' => '', 'amount' => -(float) $row['amount'], 'backAmount' => (float) $user['wallet_balance'], 'createTime' => $row['createTime'], 'remark' => $row['status']];
+        $list[] = ['id' => $row['orderNo'], 'orderNo' => $row['orderNo'], 'vendorCode' => '', 'type' => 'Withdraw', 'subType' => '', 'amount' => -(float) $row['amount'], 'backAmount' => $backBalance, 'createTime' => $row['createTime'], 'remark' => $row['status']];
     }
     foreach (api_lottery_record_page($input)['data']['list'] ?? [] as $row) {
-        $list[] = ['id' => $row['orderNo'], 'orderNo' => $row['orderNo'], 'vendorCode' => 'ARLottery', 'type' => 'Bet', 'subType' => $row['gameCode'], 'amount' => -(float) $row['betAmount'], 'backAmount' => (float) $user['game_balance'], 'createTime' => $row['createTime'], 'remark' => $row['status']];
+        $list[] = ['id' => $row['orderNo'], 'orderNo' => $row['orderNo'], 'vendorCode' => 'ARLottery', 'type' => 'Bet', 'subType' => $row['gameCode'], 'amount' => -(float) $row['betAmount'], 'backAmount' => $backBalance, 'createTime' => $row['createTime'], 'remark' => $row['status']];
     }
     usort($list, function ($a, $b) {
         return (int) $b['createTime'] <=> (int) $a['createTime'];
@@ -4158,6 +5225,514 @@ function api_user_financial_payload(array $input): array
         'totalPage' => count($list) ? 1 : 0,
         'totalCount' => count($list),
     ]);
+}
+
+/**
+ * Gift code (reward redemption code) endpoints.
+ *
+ * The site's /gift page sends {giftCode: "..."} to Activity/ReceiveRedEnvelope
+ * and then lists past redemptions. Before this the claim was answered with a
+ * blanket "success" while nothing was credited - the code was never checked
+ * against the gift_codes table that the admin panel writes.
+ */
+function api_gift_code_redeem_payload(array $input): array
+{
+    $pdo = api_pdo();
+    if (!$pdo) {
+        return api_error('Database not available', 500);
+    }
+
+    $code = strtoupper(trim((string) api_param($input, 'giftCode', api_param($input, 'code', ''))));
+    if ($code === '') {
+        return api_error('Please enter a redemption code', 400);
+    }
+
+    $user = api_primary_user();
+    $userId = (int) ($user['id'] ?? 0);
+    if ($userId <= 0) {
+        return api_error('Please login first', 401);
+    }
+
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM gift_codes WHERE UPPER(code) = ? LIMIT 1");
+        $stmt->execute([$code]);
+        $gift = $stmt->fetch();
+    } catch (Throwable $e) {
+        return api_error('Gift code check failed: ' . $e->getMessage(), 500);
+    }
+
+    if (!$gift) {
+        return api_error('Invalid redemption code', 404);
+    }
+    if (isset($gift['enabled']) && (int) $gift['enabled'] !== 1) {
+        return api_error('This redemption code is disabled', 405);
+    }
+    $maxRedeem = (int) ($gift['max_redeem'] ?? 1);
+    $redeemed = (int) ($gift['redeemed_count'] ?? 0);
+    if ($maxRedeem > 0 && $redeemed >= $maxRedeem) {
+        return api_error('This redemption code has already been fully redeemed', 406);
+    }
+    if (!empty($gift['expired_at']) && strtotime((string) $gift['expired_at']) !== false && strtotime((string) $gift['expired_at']) < time()) {
+        return api_error('This redemption code has expired', 410);
+    }
+
+    // One claim per user for the same code, so a limited code cannot be farmed.
+    try {
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM gift_code_redemptions WHERE UPPER(code) = ? AND user_id = ?");
+        $stmt->execute([$code, $userId]);
+        if ((int) $stmt->fetchColumn() > 0) {
+            return api_error('You have already redeemed this code', 409);
+        }
+    } catch (Throwable $e) {
+        // Table missing on a very old DB: the claim still goes through.
+    }
+
+    $amount = (float) ($gift['prize_amount'] ?? 0);
+    if ($amount <= 0) {
+        return api_error('This code has no reward value', 411);
+    }
+
+    // Single entry point for every money movement (mirrors wallet + game).
+    $result = api_wallet_apply_change($userId, $amount, 'wallet', 'Gift code redeemed: ' . $code);
+    if (empty($result['success'])) {
+        return api_error((string) ($result['message'] ?? 'Could not credit the reward'), 500);
+    }
+    $balanceAfter = (float) ($result['new_balance'] ?? 0);
+
+    try {
+        $pdo->prepare("UPDATE gift_codes SET redeemed_count = redeemed_count + 1 WHERE id = ?")->execute([(int) $gift['id']]);
+        $pdo->prepare("INSERT INTO gift_code_redemptions (code, gift_code_id, user_id, amount, balance_after) VALUES (?, ?, ?, ?, ?)")
+            ->execute([$code, (int) $gift['id'], $userId, $amount, $balanceAfter]);
+    } catch (Throwable $e) {
+        // Balance is already credited; the bookkeeping tables are best effort.
+    }
+
+    api_audit('gift_code_redeemed', $code, ['user_id' => $userId, 'amount' => $amount]);
+    if (class_exists('AuthController')) {
+        AuthController::logActivity(0, 'gift_code_redeemed', 'gift_codes', $code, json_encode(['user_id' => $userId, 'amount' => $amount]));
+    }
+
+    return api_success([
+        'prizeAmount' => $amount,
+        'rewardAmount' => $amount,
+        'balance' => $balanceAfter,
+        'giftCode' => $code,
+        'isWin' => true,
+    ]);
+}
+
+/** Redemption history of the logged in user (the /gift page list). */
+function api_gift_code_records_payload(array $input): array
+{
+    $pdo = api_pdo();
+    $user = api_primary_user();
+    $userId = (int) ($user['id'] ?? 0);
+    $pageNo = max(1, (int) api_param($input, 'pageNo', 1));
+    $pageSize = max(1, (int) api_param($input, 'pageSize', 20));
+
+    if (!$pdo || $userId <= 0) {
+        return api_success(['list' => [], 'pageNo' => $pageNo, 'totalPage' => 0, 'totalCount' => 0]);
+    }
+
+    try {
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM gift_code_redemptions WHERE user_id = ?");
+        $stmt->execute([$userId]);
+        $total = (int) $stmt->fetchColumn();
+
+        $offset = ($pageNo - 1) * $pageSize;
+        $stmt = $pdo->prepare("SELECT code, amount, balance_after, created_at FROM gift_code_redemptions WHERE user_id = ? ORDER BY id DESC LIMIT $pageSize OFFSET $offset");
+        $stmt->execute([$userId]);
+        $rows = $stmt->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return api_success(['list' => [], 'pageNo' => $pageNo, 'totalPage' => 0, 'totalCount' => 0]);
+    }
+
+    $list = [];
+    foreach ($rows as $row) {
+        $list[] = [
+            'id' => (string) $row['code'],
+            'orderNo' => (string) $row['code'],
+            'code' => (string) $row['code'],
+            'title' => (string) $row['code'],
+            'rewardType' => 13,
+            'rewardAmount' => (float) $row['amount'],
+            'amount' => (float) $row['amount'],
+            'balanceAfter' => (float) $row['balance_after'],
+            'status' => 1,
+            'createTime' => (string) $row['created_at'],
+            'createdAt' => (string) $row['created_at'],
+        ];
+    }
+
+    return api_success([
+        'list' => $list,
+        'pageNo' => $pageNo,
+        'totalPage' => $pageSize > 0 ? (int) ceil($total / $pageSize) : 0,
+        'totalCount' => $total,
+    ]);
+}
+
+/** Self service categories: one per admin panel support tab. */
+function api_work_order_categories(): array
+{
+    // category slug => [type id, display label, description, icon]
+    return [
+        'support_deposit'  => [9,  'Deposit not received', 'Deposit is not credited to my account', '/img/6006/other/deposit.webp', 10],
+        'support_withdraw' => [10, 'Withdrawal problem', 'Withdrawal is pending or failed', '/img/6006/other/withdraw.webp', 20],
+        'support_ifsc'     => [11, 'Correct IFSC Code', 'My bank IFSC code is wrong', '/img/6006/other/ifsc.webp', 30],
+        'support_bank'     => [12, 'Bank card modification', 'Change my bank card details', '/img/6006/other/bank.webp', 40],
+        'support_game'     => [13, 'Game problem', 'Bet, result or balance problem in a game', '/img/6006/other/game.webp', 50],
+    ];
+}
+
+/** Make sure the work_order_types table is filled (and return it). */
+function api_work_order_types(bool $seed = true): array
+{
+    $pdo = api_pdo();
+    if (!$pdo) {
+        return [];
+    }
+    $out = [];
+    try {
+        $rows = $pdo->query("SELECT * FROM work_order_types ORDER BY sort ASC, id ASC")->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        $rows = [];
+    }
+    if (!$rows && $seed) {
+        $driver = api_db_driver($pdo);
+        $insert = $driver === 'mysql'
+            ? "INSERT IGNORE INTO work_order_types (category, type_id, display_name, description, icon, sort, enabled) VALUES (?, ?, ?, ?, ?, ?, 1)"
+            : "INSERT OR IGNORE INTO work_order_types (category, type_id, display_name, description, icon, sort, enabled) VALUES (?, ?, ?, ?, ?, ?, 1)";
+        foreach (api_work_order_categories() as $slug => $meta) {
+            try {
+                $pdo->prepare($insert)->execute([$slug, $meta[0], $meta[1], $meta[2], $meta[3], $meta[4]]);
+            } catch (Throwable $e) {
+            }
+        }
+        try {
+            $rows = $pdo->query("SELECT * FROM work_order_types ORDER BY sort ASC, id ASC")->fetchAll() ?: [];
+        } catch (Throwable $e) {
+            $rows = [];
+        }
+    }
+    foreach ($rows as $row) {
+        $out[(string) $row['category']] = $row;
+    }
+    return $out;
+}
+
+/** Category slug for a ticket (works for old rows without a category). */
+function api_ticket_category(array $ticket): string
+{
+    $category = (string) ($ticket['category'] ?? '');
+    if ($category !== '') {
+        return $category;
+    }
+    $haystack = strtolower((string) ($ticket['title'] ?? ''));
+    if (strpos($haystack, 'deposit') !== false || strpos($haystack, 'recharge') !== false) {
+        return 'support_deposit';
+    }
+    if (strpos($haystack, 'withdraw') !== false) {
+        return 'support_withdraw';
+    }
+    if (strpos($haystack, 'ifsc') !== false) {
+        return 'support_ifsc';
+    }
+    if (strpos($haystack, 'bank') !== false) {
+        return 'support_bank';
+    }
+    return 'support_game';
+}
+
+function api_work_order_form_list_payload(): array
+{
+    $types = api_work_order_types();
+    if (!$types) {
+        // Fallback to the original saved list when the table is unavailable.
+        $override = api_get_override('WorkOrder/GetFormList');
+        if ($override) {
+            $decoded = api_json_decode_lenient((string) $override['content']);
+            if ($decoded['ok']) {
+                return $decoded['data'];
+            }
+        }
+    }
+
+    $list = [];
+    foreach ($types as $slug => $row) {
+        $list[] = [
+            'id' => (int) $row['type_id'] * 10 + (int) $row['id'],
+            'workOrderTypeId' => (int) $row['type_id'],
+            'workOrderTypeName' => (string) $row['display_name'],
+            'displayName' => (string) $row['display_name'],
+            'description' => (string) ($row['description'] ?? ''),
+            'sort' => (int) ($row['sort'] ?? 100),
+            'icon' => (string) ($row['icon'] ?? ''),
+            'category' => (string) $slug,
+            'state' => (int) ($row['enabled'] ?? 1),
+        ];
+    }
+    return api_success($list);
+}
+
+function api_work_order_form_fields_payload(array $input): array
+{
+    $formId = (int) api_param($input, 'workOrderFormConfigId', api_param($input, 'formId', api_param($input, 'id', 0)));
+    $category = (string) api_param($input, 'category', '');
+    if ($category === '' && $formId > 0) {
+        foreach (api_work_order_types() as $slug => $row) {
+            if ((int) $row['type_id'] * 10 + (int) $row['id'] === $formId || (int) $row['type_id'] === $formId) {
+                $category = (string) $slug;
+                break;
+            }
+        }
+    }
+
+    $fields = [
+        ['id' => 1, 'fieldName' => 'Describe your problem', 'typeCode' => 'TEXTAREA', 'isRequired' => 1, 'sort' => 0, 'maxLength' => 500],
+        ['id' => 2, 'fieldName' => 'Order number (optional)', 'typeCode' => 'TEXT', 'isRequired' => 0, 'sort' => 1, 'maxLength' => 80],
+        ['id' => 3, 'fieldName' => 'Screenshot / proof (optional)', 'typeCode' => 'IMAGE', 'isRequired' => 0, 'sort' => 2, 'maxLength' => 0],
+    ];
+
+    return api_success([
+        'formFields' => $fields,
+        'workOrderFormConfigId' => $formId,
+        'category' => $category,
+        'kindTipsText' => 'Our support team replies inside this ticket.',
+    ]);
+}
+
+function api_work_order_submit(array $input): array
+{
+    $pdo = api_pdo();
+    if (!$pdo) {
+        return api_error('Database not available', 500);
+    }
+
+    $user = api_primary_user();
+    $userId = (int) ($user['id'] ?? 0);
+    if ($userId <= 0) {
+        return api_error('Please login first', 401);
+    }
+
+    $category = (string) api_param($input, 'category', '');
+    $title = trim((string) api_param($input, 'title', api_param($input, 'subject', '')));
+    $message = trim((string) api_param($input, 'message', api_param($input, 'content', api_param($input, 'describe', ''))));
+    $orderNo = trim((string) api_param($input, 'orderNo', api_param($input, 'order_no', '')));
+
+    $types = api_work_order_types();
+    if ($category === '' || !isset($types[$category])) {
+        $typeId = (int) api_param($input, 'workOrderTypeId', api_param($input, 'typeId', 0));
+        foreach ($types as $slug => $row) {
+            if ((int) $row['type_id'] === $typeId) {
+                $category = (string) $slug;
+                break;
+            }
+        }
+    }
+    if ($category === '' || !isset($types[$category])) {
+        $category = 'support_game';
+    }
+    if ($title === '') {
+        $title = (string) ($types[$category]['display_name'] ?? 'Support request');
+    }
+
+    // The site collects answers as formFields/params - join them into one text.
+    if ($message === '' && !empty($input['params']) && is_array($input['params'])) {
+        $parts = [];
+        foreach ($input['params'] as $key => $value) {
+            if (is_array($value) || $value === null || $value === '') {
+                continue;
+            }
+            $label = ucwords(str_replace(['_', '-'], ' ', (string) $key));
+            $parts[] = $label . ': ' . (string) $value;
+        }
+        $message = implode("\n", $parts);
+    }
+
+    $driver = api_db_driver($pdo);
+    try {
+        $sql = "INSERT INTO support_tickets (user_id, title, category, status, order_no, created_at, updated_at) VALUES (?, ?, ?, 'open', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)";
+        if ($driver === 'mysql') {
+            $sql = "INSERT INTO support_tickets (user_id, title, category, status, order_no, created_at, updated_at) VALUES (?, ?, ?, 'open', ?, NOW(), NOW())";
+        }
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$userId, $title, $category, $orderNo !== '' ? $orderNo : null]);
+        $ticketId = (int) $pdo->lastInsertId();
+    } catch (Throwable $e) {
+        return api_error('Could not create the ticket: ' . $e->getMessage(), 500);
+    }
+
+    if ($message !== '') {
+        try {
+            $pdo->prepare("INSERT INTO ticket_replies (ticket_id, sender_type, sender_id, message) VALUES (?, 'user', ?, ?)")
+                ->execute([$ticketId, $userId, $message]);
+        } catch (Throwable $e) {
+        }
+    }
+
+    api_audit('work_order_submitted', (string) $ticketId, ['category' => $category, 'order_no' => $orderNo]);
+
+    return api_success(['workOrderId' => $ticketId, 'id' => $ticketId, 'ticketId' => $ticketId, 'status' => 'open']);
+}
+
+function api_work_order_page_list(array $input): array
+{
+    $pdo = api_pdo();
+    $user = api_primary_user();
+    $userId = (int) ($user['id'] ?? 0);
+    $pageNo = max(1, (int) api_param($input, 'pageNo', 1));
+    $pageSize = max(1, (int) api_param($input, 'pageSize', 20));
+
+    if (!$pdo || $userId <= 0) {
+        return api_success(['list' => [], 'pageNo' => $pageNo, 'totalPage' => 0, 'totalCount' => 0]);
+    }
+
+    try {
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM support_tickets WHERE user_id = ?");
+        $stmt->execute([$userId]);
+        $total = (int) $stmt->fetchColumn();
+
+        $offset = ($pageNo - 1) * $pageSize;
+        $stmt = $pdo->prepare("SELECT * FROM support_tickets WHERE user_id = ? ORDER BY id DESC LIMIT $pageSize OFFSET $offset");
+        $stmt->execute([$userId]);
+        $rows = $stmt->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return api_success(['list' => [], 'pageNo' => $pageNo, 'totalPage' => 0, 'totalCount' => 0]);
+    }
+
+    $list = [];
+    foreach ($rows as $row) {
+        $list[] = [
+            'id' => (int) $row['id'],
+            'orderNo' => (string) $row['id'],
+            'workOrderId' => (int) $row['id'],
+            'title' => (string) $row['title'],
+            'category' => api_ticket_category($row),
+            'status' => (string) $row['status'],
+            'createTime' => (string) $row['created_at'],
+            'updateTime' => (string) $row['updated_at'],
+            'orderNoInput' => (string) ($row['order_no'] ?? ''),
+        ];
+    }
+
+    return api_success([
+        'list' => $list,
+        'pageNo' => $pageNo,
+        'totalPage' => $pageSize > 0 ? (int) ceil($total / $pageSize) : 0,
+        'totalCount' => $total,
+    ]);
+}
+
+function api_work_order_comments(array $input): array
+{
+    $pdo = api_pdo();
+    $ticketId = (int) api_param($input, 'workOrderId', api_param($input, 'ticketId', api_param($input, 'id', 0)));
+    if (!$pdo || $ticketId <= 0) {
+        return api_success([]);
+    }
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM ticket_replies WHERE ticket_id = ? ORDER BY id ASC");
+        $stmt->execute([$ticketId]);
+        $rows = $stmt->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return api_success([]);
+    }
+
+    $list = [];
+    foreach ($rows as $row) {
+        $isAdmin = (string) $row['sender_type'] === 'admin';
+        $list[] = [
+            'id' => (int) $row['id'],
+            'workOrderId' => $ticketId,
+            'senderType' => $isAdmin ? 2 : 1,
+            'isAdmin' => $isAdmin,
+            'content' => (string) $row['message'],
+            'createTime' => (string) $row['created_at'],
+        ];
+    }
+    return api_success($list);
+}
+
+function api_work_order_submit_comment(array $input): array
+{
+    $pdo = api_pdo();
+    $ticketId = (int) api_param($input, 'workOrderId', api_param($input, 'ticketId', api_param($input, 'id', 0)));
+    $message = trim((string) api_param($input, 'content', api_param($input, 'message', '')));
+    if (!$pdo || $ticketId <= 0 || $message === '') {
+        return api_error('Invalid ticket or empty message', 400);
+    }
+    $user = api_primary_user();
+    $userId = (int) ($user['id'] ?? 0);
+
+    try {
+        $pdo->prepare("INSERT INTO ticket_replies (ticket_id, sender_type, sender_id, message) VALUES (?, 'user', ?, ?)")
+            ->execute([$ticketId, $userId, $message]);
+        $pdo->prepare("UPDATE support_tickets SET status = 'open', updated_at = CURRENT_TIMESTAMP WHERE id = ?")->execute([$ticketId]);
+    } catch (Throwable $e) {
+        return api_error('Could not send the message: ' . $e->getMessage(), 500);
+    }
+    return api_success(true);
+}
+
+function api_work_order_data_check(array $input): array
+{
+    $pdo = api_pdo();
+    $orderNo = trim((string) api_param($input, 'orderNo', api_param($input, 'order_no', '')));
+    if (!$pdo || $orderNo === '') {
+        return api_success(true);
+    }
+    try {
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM recharge_orders WHERE order_no = ?");
+        $stmt->execute([$orderNo]);
+        $found = (int) $stmt->fetchColumn() > 0;
+        if (!$found) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM withdraw_orders WHERE order_no = ?");
+            $stmt->execute([$orderNo]);
+            $found = (int) $stmt->fetchColumn() > 0;
+        }
+    } catch (Throwable $e) {
+        return api_success(true);
+    }
+    return api_success($found);
+}
+
+/** Saved withdrawal wallets of the logged in user (built from past orders). */
+function api_user_withdraw_wallets_payload(): array
+{
+    $pdo = api_pdo();
+    $user = api_primary_user();
+    $userId = (int) ($user['id'] ?? 0);
+    if (!$pdo || $userId <= 0) {
+        return [];
+    }
+    try {
+        $stmt = $pdo->prepare("SELECT withdraw_type, account_json, MAX(id) AS last_id FROM withdraw_orders WHERE user_id = ? AND account_json IS NOT NULL AND account_json <> '' GROUP BY withdraw_type, account_json ORDER BY last_id DESC LIMIT 20");
+        $stmt->execute([$userId]);
+        $rows = $stmt->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+
+    $list = [];
+    foreach ($rows as $row) {
+        $account = json_decode((string) $row['account_json'], true);
+        if (!is_array($account)) {
+            $account = [];
+        }
+        $type = (string) $row['withdraw_type'];
+        $list[] = [
+            'id' => (int) $row['last_id'],
+            'withdrawType' => $type,
+            'name' => $type,
+            'accountNo' => (string) ($account['accountNo'] ?? $account['upiId'] ?? $account['account'] ?? ''),
+            'accountName' => (string) ($account['accountName'] ?? $account['name'] ?? ''),
+            'ifscCode' => (string) ($account['ifscCode'] ?? $account['ifsc'] ?? ''),
+            'bankName' => (string) ($account['bankName'] ?? $account['bank'] ?? ''),
+            'state' => 1,
+        ];
+    }
+    return $list;
 }
 
 function api_explicit_dynamic_response(string $endpoint, array $input): ?array
@@ -4188,6 +5763,9 @@ function api_explicit_dynamic_response(string $endpoint, array $input): ?array
     }
 
     if ($e === 'user/getuserinfo') {
+        if (!api_has_session()) {
+            return api_error('Please login', 401, -1);
+        }
         return api_success(api_user_info_data());
     }
     if ($e === 'home/checkcanbet') {
@@ -4210,13 +5788,22 @@ function api_explicit_dynamic_response(string $endpoint, array $input): ?array
         return api_home_popup_payload();
     }
     if ($e === 'thirdgame/getargamebalance') {
-        return api_success((float) api_primary_user()['game_balance']);
+        $user = api_primary_user();
+        $balance = api_wallet_balance_of($user);
+        return api_success([
+            'arGameBalance' => $balance,
+            'balance' => $balance,
+            'currency' => (string) (api_config()['site']['currency'] ?? 'INR'),
+        ]);
     }
     if ($e === 'thirdgame/getargameandplatwallets') {
         $user = api_primary_user();
+        $balance = api_wallet_balance_of($user);
+        // One player, one pot of money. The home header adds these rows up, so
+        // reporting the same amount twice made it show double the real balance.
         return api_success([
-            ['vendorCode' => 'ARGame', 'balance' => (float) $user['game_balance'], 'currency' => 'INR'],
-            ['vendorCode' => 'PlatForm', 'balance' => (float) $user['wallet_balance'], 'currency' => 'INR'],
+            ['vendorCode' => 'ARGame', 'balance' => $balance, 'currency' => 'INR'],
+            ['vendorCode' => 'PlatForm', 'balance' => 0, 'currency' => 'INR'],
         ]);
     }
     if ($e === 'thirdgame/transfer') {
@@ -4226,9 +5813,12 @@ function api_explicit_dynamic_response(string $endpoint, array $input): ?array
         return api_thirdgame_transfer_payload($input, true);
     }
     if ($e === 'thirdgame/notifyargamerecover') {
+        $balance = api_wallet_balance_of(api_primary_user());
         return api_success([
-            'walletBalance' => (float) api_primary_user()['wallet_balance'],
-            'gameBalance' => (float) api_primary_user()['game_balance'],
+            'balance' => $balance,
+            'walletBalance' => $balance,
+            'gameBalance' => $balance,
+            'currency' => (string) (api_config()['site']['currency'] ?? 'INR'),
         ]);
     }
     if ($e === 'game/gethotgamelist') {
@@ -4318,6 +5908,62 @@ function api_explicit_dynamic_response(string $endpoint, array $input): ?array
     if ($e === 'withdraw/sumitwithdraw' || $e === 'withdraw/submitwithdraw' || $e === 'withdraw/addwithdraworder') {
         return api_withdraw_submit_payload($input);
     }
+    if ($e === 'withdraw/getuserwithdrawwallet') {
+        return api_success(api_user_withdraw_wallets_payload());
+    }
+
+    // ---- Gift codes / reward redemption codes ------------------------------
+    if (in_array($e, ['activity/receiveredenvelope', 'activity/giftcode', 'activity/submitgiftcode'], true)) {
+        return api_gift_code_redeem_payload($input);
+    }
+    if (in_array($e, [
+        'activity/getuserredenveloperecordpagelist',
+        'activity/getpagelistuserredenveloperecord',
+        'activity/getuserredenveloperecordlist',
+    ], true)) {
+        return api_gift_code_records_payload($input);
+    }
+
+    // ---- Self service centre / support tickets ----------------------------
+    if ($e === 'workorder/getformlist') {
+        return api_work_order_form_list_payload();
+    }
+    if ($e === 'workorder/getformfieldlist') {
+        return api_work_order_form_fields_payload($input);
+    }
+    if ($e === 'workorder/submit' || $e === 'workorder/create') {
+        return api_work_order_submit($input);
+    }
+    if ($e === 'workorder/getpagelist' || $e === 'workorder/getrecordpage') {
+        return api_work_order_page_list($input);
+    }
+    if ($e === 'workorder/getcommentlist') {
+        return api_work_order_comments($input);
+    }
+    if ($e === 'workorder/submitcomment') {
+        return api_work_order_submit_comment($input);
+    }
+    if ($e === 'workorder/datacheckbyorderno') {
+        return api_work_order_data_check($input);
+    }
+    if ($e === 'workorder/sendreminder') {
+        return api_success(true);
+    }
+    if ($e === 'workorder/gethomepageconfigs' || $e === 'workorder/getoutlinklist') {
+        // keep the saved reference payload when present, else a sane default
+        $override = api_get_override('WorkOrder/' . (strpos($e, 'gethomepage') !== false ? 'GetHomePageConfigs' : 'GetOutLinkList'));
+        if ($override) {
+            $decoded = api_json_decode_lenient((string) $override['content']);
+            if ($decoded['ok']) {
+                return $decoded['data'];
+            }
+        }
+        return api_success([
+            'isEnabledFaq' => true,
+            'kindTipsText' => 'Describe the problem and our team will reply in this ticket.',
+        ]);
+    }
+
     return null;
 }
 

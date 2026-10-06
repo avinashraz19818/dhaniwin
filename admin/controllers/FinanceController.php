@@ -63,11 +63,13 @@ class FinanceController
                     'username' => htmlspecialchars((string)($row['username'] ?? 'Anonymous')),
                     'nickname' => htmlspecialchars((string)($row['nickname'] ?? 'Member')),
                     'amount' => (float)$row['amount'],
-                    'payment_type' => $row['payment_type'] ?? 'UPI',
+                    'payment_type' => (string)($row['payment_type'] ?? ($row['method_name'] ?? 'UPI')),
                     'method_name' => $row['method_name'] ?? 'UPI Gateway',
                     'status' => $row['status'],
                     'utr' => htmlspecialchars((string)($row['utr'] ?? '')),
-                    'screenshot_url' => $row['screenshot_url'],
+                    'screenshot_url' => (string)($row['screenshot_url'] ?? ''),
+                    'bonus_amount' => (float)($row['bonus_amount'] ?? 0),
+                    'remarks' => htmlspecialchars((string)($row['remarks'] ?? '')),
                     'created_at' => $row['created_at']
                 ];
             }
@@ -111,6 +113,12 @@ class FinanceController
                 $args[] = $statusFilter;
             }
 
+            $typeFilter = trim((string)($params['withdraw_type'] ?? ''));
+            if ($typeFilter !== "") {
+                $conditions[] = "w.withdraw_type = ?";
+                $args[] = $typeFilter;
+            }
+
             $whereClause = !empty($conditions) ? " WHERE " . implode(" AND ", $conditions) : "";
 
             $totalQuery = "SELECT COUNT(*) FROM withdraw_orders";
@@ -143,10 +151,12 @@ class FinanceController
                     'username' => htmlspecialchars((string)($row['username'] ?? 'Anonymous')),
                     'nickname' => htmlspecialchars((string)($row['nickname'] ?? 'Member')),
                     'amount' => (float)$row['amount'],
-                    'payment_type' => $row['payment_type'] ?? 'UPI',
+                    'payment_type' => (string)($row['withdraw_type'] ?? $row['payment_type'] ?? 'UPI'),
+                    'withdraw_type' => (string)($row['withdraw_type'] ?? 'UPI'),
                     'status' => $row['status'],
                     'account_json' => $row['account_json'],
                     'remarks' => htmlspecialchars((string)($row['remarks'] ?? '')),
+                    'processed_at' => (string)($row['processed_at'] ?? ''),
                     'created_at' => $row['created_at']
                 ];
             }
@@ -185,8 +195,8 @@ class FinanceController
 
             $pdo->beginTransaction();
 
-            $stmt = $pdo->prepare("UPDATE recharge_orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-            $stmt->execute([$status, $id]);
+            $stmt = $pdo->prepare("UPDATE recharge_orders SET status = ?, remarks = COALESCE(NULLIF(?, ''), remarks), updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+            $stmt->execute([$status, $remarks, $id]);
 
             // If approved, add balance to user
             if (in_array(strtolower($status), ['approved', 'success', 'completed', 'paid'], true)) {
@@ -205,29 +215,23 @@ class FinanceController
                 }
 
                 $totalAdd = (float)$order['amount'] + $bonus;
-
-                // Fetch user details
-                $stmt = $pdo->prepare("SELECT user_id, wallet_balance FROM api_users WHERE id = ? LIMIT 1");
-                $stmt->execute([$order['user_id']]);
-                $userRow = $stmt->fetch();
-                if ($userRow) {
-                    $playerUserId = (int)$userRow['user_id'];
-                    $oldBal = (float)$userRow['wallet_balance'];
-                    $newBal = $oldBal + $totalAdd;
-
-                    $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-                    $stmt->execute([$newBal, $order['user_id']]);
-
-                    // Wallet log
-                    $stmt = $pdo->prepare("INSERT INTO wallet_logs (user_id, type, amount, balance_before, balance_after, notes) VALUES (?, 'wallet', ?, ?, ?, ?)");
-                    $stmt->execute([
-                        $playerUserId, 
-                        $totalAdd, 
-                        $oldBal, 
-                        $newBal, 
-                        "Recharge deposit approved (Order: " . $order['order_no'] . ($bonus > 0 ? " including first deposit bonus " . $bonus : "") . ")"
-                    ]);
+                if (session_status() === PHP_SESSION_NONE) {
+                    @session_start();
                 }
+                try {
+                    $pdo->prepare("UPDATE recharge_orders SET bonus_amount = ?, processed_by = ?, processed_at = CURRENT_TIMESTAMP WHERE id = ?")
+                        ->execute([$bonus, (int)($_SESSION['admin_id'] ?? 0), $id]);
+                } catch (Throwable $e) {
+                }
+
+                // Credit the user. api_wallet_apply_change mirrors the amount into
+                // both balance columns (site wallet + game) and logs best-effort.
+                api_wallet_apply_change(
+                    (int) $order['user_id'],
+                    $totalAdd,
+                    'wallet',
+                    "Recharge deposit approved (Order: " . $order['order_no'] . ($bonus > 0 ? " including first deposit bonus " . $bonus : "") . ")"
+                );
             }
 
             $pdo->commit();
@@ -263,34 +267,24 @@ class FinanceController
 
             $pdo->beginTransaction();
 
-            $stmt = $pdo->prepare("UPDATE withdraw_orders SET status = ?, remarks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-            $stmt->execute([$status, $remarks, $id]);
+            if (session_status() === PHP_SESSION_NONE) {
+                @session_start();
+            }
+            $processedBy = (int)($_SESSION['admin_id'] ?? 0);
+            $stmt = $pdo->prepare("UPDATE withdraw_orders SET status = ?, remarks = ?, processed_by = ?, processed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+            $stmt->execute([$status, $remarks, $processedBy, $id]);
 
             // If rejected, refund the user's wallet balance
             if (in_array(strtolower($status), ['rejected', 'cancelled', 'canceled', 'failed'], true)) {
                 $amount = (float)$order['amount'];
 
-                $stmt = $pdo->prepare("SELECT user_id, wallet_balance FROM api_users WHERE id = ? LIMIT 1");
-                $stmt->execute([$order['user_id']]);
-                $userRow = $stmt->fetch();
-                if ($userRow) {
-                    $playerUserId = (int)$userRow['user_id'];
-                    $oldBal = (float)$userRow['wallet_balance'];
-                    $newBal = $oldBal + $amount;
-
-                    $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-                    $stmt->execute([$newBal, $order['user_id']]);
-
-                    // Wallet log
-                    $stmt = $pdo->prepare("INSERT INTO wallet_logs (user_id, type, amount, balance_before, balance_after, notes) VALUES (?, 'wallet', ?, ?, ?, ?)");
-                    $stmt->execute([
-                        $playerUserId, 
-                        $amount, 
-                        $oldBal, 
-                        $newBal, 
-                        "Withdrawal order rejected refund (Order: " . $order['order_no'] . "). Reason: " . $remarks
-                    ]);
-                }
+                // Refund through the shared helper so both balance columns move.
+                api_wallet_apply_change(
+                    (int) $order['user_id'],
+                    $amount,
+                    'wallet',
+                    "Withdrawal order rejected refund (Order: " . $order['order_no'] . "). Reason: " . $remarks
+                );
             }
 
             $pdo->commit();

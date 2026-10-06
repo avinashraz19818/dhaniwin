@@ -226,7 +226,8 @@ class AuthController
 
             // Assign permissions
             if ($roleId !== 1 && !empty($permissions)) {
-                $stmtPerm = $pdo->prepare("INSERT IGNORE INTO admin_user_permissions (admin_id, permission_id) VALUES (?, ?)");
+                $ignoreVerb = api_db_driver($pdo) === 'sqlite' ? 'INSERT OR IGNORE' : 'INSERT IGNORE';
+                $stmtPerm = $pdo->prepare($ignoreVerb . " INTO admin_user_permissions (admin_id, permission_id) VALUES (?, ?)");
                 foreach ($permissions as $permKeyOrId) {
                     if (is_numeric($permKeyOrId)) {
                         $stmtPerm->execute([$newAdminId, (int)$permKeyOrId]);
@@ -262,7 +263,8 @@ class AuthController
             }
 
             $pdo->prepare("DELETE FROM admin_user_permissions WHERE admin_id = ?")->execute([$adminId]);
-            $stmtPerm = $pdo->prepare("INSERT IGNORE INTO admin_user_permissions (admin_id, permission_id) VALUES (?, ?)");
+            $ignoreVerb = api_db_driver($pdo) === 'sqlite' ? 'INSERT OR IGNORE' : 'INSERT IGNORE';
+            $stmtPerm = $pdo->prepare($ignoreVerb . " INTO admin_user_permissions (admin_id, permission_id) VALUES (?, ?)");
             foreach ($permissions as $permKeyOrId) {
                 if (is_numeric($permKeyOrId)) {
                     $stmtPerm->execute([$adminId, (int)$permKeyOrId]);

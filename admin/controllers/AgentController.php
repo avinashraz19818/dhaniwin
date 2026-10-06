@@ -51,8 +51,14 @@ class AgentController
             $stmt->execute([$userId]);
             $totalComm = (float)$stmt->fetchColumn();
 
-            // Sum today's commission
-            $stmt = $pdo->prepare("SELECT COALESCE(SUM(commission_amount), 0) FROM agent_commissions WHERE user_id = ? AND (created_at >= DATE('now', 'start of day') OR created_at >= CURDATE())");
+            // Sum today's commission. The old string mixed SQLite and MySQL
+            // syntax (DATE('now','start of day') OR CURDATE()) and threw on both
+            // drivers, so the agent screen showed no commission for today.
+            $driver = api_db_driver($pdo);
+            $todayStart = $driver === 'mysql'
+                ? "created_at >= CURDATE() AND created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
+                : "date(created_at) = date('now')";
+            $stmt = $pdo->prepare("SELECT COALESCE(SUM(commission_amount), 0) FROM agent_commissions WHERE user_id = ? AND " . $todayStart);
             $stmt->execute([$userId]);
             $todayComm = (float)$stmt->fetchColumn();
 
@@ -116,9 +122,18 @@ class AgentController
 
                 $commAmount = round($stake * $rate, 4);
                 if ($commAmount > 0) {
-                    // Update agent's wallet
-                    $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = wallet_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?");
-                    $stmt->execute([$commAmount, $currentRef]);
+                    // Credit through the shared helper so the agent's wallet and
+                    // game balance stay in sync and the credit is logged.
+                    $agentRow = null;
+                    $stmt = $pdo->prepare("SELECT * FROM api_users WHERE user_id = ? LIMIT 1");
+                    $stmt->execute([$currentRef]);
+                    $agentRow = $stmt->fetch();
+                    if ($agentRow) {
+                        api_wallet_apply_change((int)$agentRow['id'], $commAmount, 'wallet', 'Agent commission level ' . $level . ' from order ' . $orderNo);
+                    } else {
+                        $stmt = $pdo->prepare("UPDATE api_users SET wallet_balance = wallet_balance + ?, game_balance = game_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?");
+                        $stmt->execute([$commAmount, $commAmount, $currentRef]);
+                    }
 
                     // Insert commission log
                     $stmt = $pdo->prepare("INSERT INTO agent_commissions (user_id, from_user_id, bet_order_no, commission_level, bet_amount, commission_amount) VALUES (?, ?, ?, ?, ?, ?)");

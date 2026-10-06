@@ -1,23 +1,14 @@
 <?php
 require_once dirname(__DIR__) . '/_bootstrap.php';
 
-$endpoint = 'Withdraw/GetWithdrawBasicInfo';
-$override = api_get_override($endpoint);
-if ($override) {
-    $decoded = api_json_decode_lenient((string) $override['content']);
-    if ($decoded['ok']) {
-        $payload = $decoded['data'];
-        api_refresh_times($payload);
-        api_emit($payload);
-    }
-}
+// Balance endpoints always answer from the database (no saved snapshot).
 
 $user = api_primary_user();
 $payload = [
         'data' => [
-            'balance' => (float) $user['wallet_balance'],
+            'balance' => api_wallet_balance_of($user),
             'realName' => '',
-            'amountCoding' => 4.11,
+            'amountCoding' => api_amount_coding(),
             'hasWithdrawPassword' => false,
             'withdrawCategoryList' => [
                 [

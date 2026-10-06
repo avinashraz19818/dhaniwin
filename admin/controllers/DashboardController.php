@@ -11,20 +11,29 @@ class DashboardController
         }
 
         try {
+            // "Today" has to be spelled per driver. The old query mixed both
+            // dialects in one string (DATE('now','start of day') OR CURDATE()),
+            // so it failed on MySQL AND on SQLite and the dashboard showed the
+            // error text instead of the tiles.
+            $driver = api_db_driver($pdo);
+            $todayStart = $driver === 'mysql'
+                ? "created_at >= CURDATE() AND created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
+                : "date(created_at) = date('now')";
+
             $totalUsers = (int)$pdo->query("SELECT COUNT(*) FROM api_users")->fetchColumn();
-            $todayUsers = (int)$pdo->query("SELECT COUNT(*) FROM api_users WHERE created_at >= DATE('now', 'start of day') OR (created_at >= CURDATE() AND created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY))")->fetchColumn();
+            $todayUsers = (int)$pdo->query("SELECT COUNT(*) FROM api_users WHERE " . $todayStart)->fetchColumn();
             
             $userWallet = (float)$pdo->query("SELECT COALESCE(SUM(wallet_balance), 0) FROM api_users")->fetchColumn();
             
             // Recharge totals
             $totalRecharge = (float)$pdo->query("SELECT COALESCE(SUM(amount), 0) FROM recharge_orders WHERE LOWER(status) IN ('approved','success','completed','complete','paid')")->fetchColumn();
-            $todayRecharge = (float)$pdo->query("SELECT COALESCE(SUM(amount), 0) FROM recharge_orders WHERE LOWER(status) IN ('approved','success','completed','complete','paid') AND (created_at >= DATE('now', 'start of day') OR (created_at >= CURDATE()))")->fetchColumn();
+            $todayRecharge = (float)$pdo->query("SELECT COALESCE(SUM(amount), 0) FROM recharge_orders WHERE LOWER(status) IN ('approved','success','completed','complete','paid') AND " . $todayStart)->fetchColumn();
             $pendingRecharge = (float)$pdo->query("SELECT COALESCE(SUM(amount), 0) FROM recharge_orders WHERE LOWER(status) IN ('pending', 'pendingreview')")->fetchColumn();
             $pendingRechargeCount = (int)$pdo->query("SELECT COUNT(*) FROM recharge_orders WHERE LOWER(status) IN ('pending', 'pendingreview')")->fetchColumn();
             
             // Withdraw totals
             $totalWithdraw = (float)$pdo->query("SELECT COALESCE(SUM(amount), 0) FROM withdraw_orders WHERE LOWER(status) IN ('approved','success','completed','complete','paid')")->fetchColumn();
-            $todayWithdraw = (float)$pdo->query("SELECT COALESCE(SUM(amount), 0) FROM withdraw_orders WHERE LOWER(status) IN ('approved','success','completed','complete','paid') AND (created_at >= DATE('now', 'start of day') OR (created_at >= CURDATE()))")->fetchColumn();
+            $todayWithdraw = (float)$pdo->query("SELECT COALESCE(SUM(amount), 0) FROM withdraw_orders WHERE LOWER(status) IN ('approved','success','completed','complete','paid') AND " . $todayStart)->fetchColumn();
             
             $todayProfit = $todayRecharge - $todayWithdraw;
 
